@@ -1,0 +1,11 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Engine bug, wrong query result, or error code
+    url: https://github.com/tamnd/zu/issues/new/choose
+    about: Anything that reproduces through the zu CLI belongs in tamnd/zu, where the engine maintainers will see it.
+  - name: Documentation or example problem
+    url: https://github.com/tamnd/zu-web/issues/new/choose
+    about: Pages, guides, and code samples live in tamnd/zu-web.
+  - name: Security report
+    url: https://github.com/tamnd/zu/security/advisories/new
+    about: One embargo process for every repository. Never file a security issue publicly.

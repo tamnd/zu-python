@@ -1,0 +1,40 @@
+name: Bug report
+description: Something in the Python client behaves wrongly
+labels: ["bug", "python"]
+body:
+  - type: checkboxes
+    id: cli
+    attributes:
+      label: Does this reproduce through the zu CLI?
+      description: Run the same query with the zu CLI against the same database. If it fails there too, this is an engine bug and belongs in tamnd/zu, not here. Engine bugs filed in client repositories are the most common way a multi-repository project loses track of them.
+      options:
+        - label: I checked, and it does not reproduce through the CLI. This is specific to this client.
+          required: true
+  - type: input
+    id: version
+    attributes:
+      label: Client version
+    validations:
+      required: true
+  - type: input
+    id: engine
+    attributes:
+      label: Engine version
+      description: The version of zu this client is linked against. Normally the same number.
+    validations:
+      required: true
+  - type: input
+    id: platform
+    attributes:
+      label: Platform and runtime
+      description: OS, architecture, and the language runtime version.
+    validations:
+      required: true
+  - type: textarea
+    id: repro
+    attributes:
+      label: What you ran, and what happened
+      description: The smallest program that shows the problem, the output you got, and the output you expected.
+      render: text
+    validations:
+      required: true
