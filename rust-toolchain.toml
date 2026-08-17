@@ -1,0 +1,7 @@
+# The same compiler the engine pins, because this crate links the
+# engine's crates directly and a binding built with a different one is
+# a different build of the same code. Held to the version in
+# tamnd/zu's toolchains.toml.
+[toolchain]
+channel = "1.97.1"
+components = ["rustfmt", "clippy"]

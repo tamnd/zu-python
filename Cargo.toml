@@ -1,0 +1,31 @@
+[package]
+name = "zudb-python"
+version = "0.0.1"
+edition = "2024"
+rust-version = "1.97"
+license = "Apache-2.0"
+repository = "https://github.com/tamnd/zu-python"
+authors = ["Tam Nguyen <tamnd87@gmail.com>"]
+publish = false
+
+[lib]
+name = "_zudb"
+crate-type = ["cdylib"]
+
+[dependencies]
+# The engine, by revision rather than by version. Nothing is published
+# yet, and a binding is built against the engine commit it will ship
+# with (ADR 0002), so a revision is the honest way to say which one.
+# A local checkout is used instead with a `paths` override in
+# `.cargo/config.toml`, which is untracked on purpose.
+zudb = { package = "zu", git = "https://github.com/tamnd/zu", rev = "67afd055032932eec36f4e373c2b82bdc4b188c9" }
+zu-common = { git = "https://github.com/tamnd/zu", rev = "67afd055032932eec36f4e373c2b82bdc4b188c9" }
+# `extension-module` is asked for by maturin, in pyproject.toml, and
+# not here. Only the build backend knows how an extension is linked on
+# the platform it is building for, and a crate that turns the feature
+# on by default is a crate `cargo build` cannot link on its own.
+pyo3 = { version = "0.29", features = ["abi3-py311"] }
+
+[profile.release]
+lto = "thin"
+strip = true

@@ -1,1 +1,15 @@
 .DS_Store
+target/
+__pycache__/
+*.pyc
+.venv/
+dist/
+.pytest_cache/
+.ruff_cache/
+.cargo/config.toml
+
+# The built extension, which maturin drops into the source tree when
+# it develops the package in place.
+*.so
+*.pyd
+*.dylib

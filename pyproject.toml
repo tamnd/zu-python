@@ -1,0 +1,58 @@
+[build-system]
+requires = ["maturin>=1.14,<2.0"]
+build-backend = "maturin"
+
+[project]
+name = "zudb"
+version = "0.0.1"
+description = "zu: an embedded property-graph database, in your process"
+readme = "README.md"
+license = "Apache-2.0"
+requires-python = ">=3.11"
+authors = [{ name = "Tam Nguyen", email = "tamnd87@gmail.com" }]
+keywords = ["graph", "database", "gql", "embedded", "analytics"]
+classifiers = [
+  "Development Status :: 2 - Pre-Alpha",
+  "Intended Audience :: Developers",
+  "Programming Language :: Python :: 3 :: Only",
+  "Programming Language :: Rust",
+  "Topic :: Database :: Database Engines/Servers",
+  "Typing :: Typed",
+]
+# Nothing. The wheel has the engine in it, and a notebook that wants a
+# DataFrame back brings its own pandas.
+dependencies = []
+
+[project.urls]
+Homepage = "https://zu.dev"
+Source = "https://github.com/tamnd/zu-python"
+Engine = "https://github.com/tamnd/zu"
+Issues = "https://github.com/tamnd/zu-python/issues"
+
+[project.optional-dependencies]
+arrow = ["pyarrow>=14"]
+pandas = ["pandas>=2.0", "pyarrow>=14"]
+polars = ["polars>=1.0"]
+
+[dependency-groups]
+dev = ["maturin>=1.14,<2.0", "pytest>=8", "ruff>=0.9"]
+
+[tool.maturin]
+python-source = "python"
+module-name = "zudb._zudb"
+# Only maturin knows how to link an extension module on every platform
+# it builds for, so the feature is asked for here rather than being on
+# by default in Cargo.toml, where it would break a plain `cargo build`.
+features = ["pyo3/extension-module"]
+strip = true
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
+
+[tool.ruff]
+target-version = "py311"
+line-length = 100
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B"]

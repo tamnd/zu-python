@@ -6,14 +6,11 @@ The Python client for [zu](https://github.com/tamnd/zu), an embedded property-gr
 import zudb
 
 with zudb.connect("social.zu1") as conn:
-    conn.execute("CREATE NODE TABLE Person(id INT64 PRIMARY KEY, name STRING)")
-    conn.load_csv("Person", "people.csv")
+    conn.execute("INSERT (p:person {uid: 1, name: 'ada'})")
+    conn.execute("INSERT (p:person {uid: $uid, name: $name})", {"uid": 2, "name": "grace"})
 
-    df = conn.sql("""
-        MATCH (p:Person)-[:Follows]->(f)
-        RETURN p.name AS name, count(*) AS n ORDER BY n DESC LIMIT 5
-    """).to_pandas()
-print(df)
+    for name, uid in conn.execute("MATCH (p:person) RETURN p.name AS name, p.uid AS uid"):
+        print(name, uid)
 ```
 
 ```
@@ -24,7 +21,9 @@ No compiler, no `pkg-config`, no postinstall script. One wheel per platform with
 
 ## What this is
 
-Built with PyO3 and maturin over `libzu`'s C ABI. The interesting parts:
+Built with PyO3 and maturin, linked against the engine crates rather than against `libzu`'s C ABI. That is ADR 0002 in the engine repository, and it is about mechanism and not about contract: this client and every client that does go through `zu.h` answer the same conformance corpus, which is what says they agree. Linking the crates is what lets a query result reach Python without being flattened through C on the way.
+
+The interesting parts:
 
 - **Arrow all the way down.** `to_arrow()`, `to_pandas()`, `to_polars()`, and `record_batches()` go through the Arrow C Data Interface with no intermediate copy. `to_pandas()` hands back Arrow-backed dtypes, which is what pandas 3 wants anyway.
 - **`register()` replacement scans.** A DataFrame in your session becomes a table you can query by name, zero-copy for Arrow-backed frames. This is the DuckDB idea worth copying wholesale, and it deletes the write-to-disk-then-load step from every "load my data" tutorial.
@@ -32,6 +31,10 @@ Built with PyO3 and maturin over `libzu`'s C ABI. The interesting parts:
 - **`Ctrl-C` interrupts a running query** within 50 ms, because a long query in a notebook that looks like a hang gets the kernel killed.
 - **Complete `.pyi` stubs inside the wheel**, checked against the runtime in CI, so mypy and pyright and your editor all work with no extra install.
 - **Graph values are real classes.** `Node`, `Rel`, and `Path` have `.labels`, `.id`, `.properties`, and an HTML repr. Not dicts, because a dict cannot tell a property named `labels` apart from the label set.
+
+## What works today
+
+The list above is what this client is for. What it does so far is the core of it: `connect`, `execute` and `sql` with named parameters, results that iterate and fetch, values as Python objects both ways including dates, times, datetimes and durations, `Node`, `Rel` and `Path` as classes, every condition as an exception class carrying its code, its position and its documentation link, and the GIL released around every statement. Arrow, `register`, the stubs and the interrupt are next, and each one lands with the tests that say it works.
 
 ## Wheels
 
