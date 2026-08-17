@@ -50,6 +50,33 @@ def social(tmp_path: Path) -> zudb.Connection:
 
 
 @pytest.fixture
+def loaded(tmp_path: Path) -> zudb.Connection:
+    """The same three people, with a rel table joining them.
+
+    Built by a load rather than by statements because a load is the only
+    thing that makes a rel table: `INSERT` names the two tables an edge
+    joins but cannot declare the table that holds it. Ada knows Grace
+    and Grace knows Kay, so there is a two-hop path through the middle
+    of it and a node at each end with one edge.
+    """
+    path = tmp_path / "loaded.zu1"
+    zudb.load(
+        path,
+        nodes="person",
+        rels="knows",
+        columns={
+            "uid": [uid for uid, _, _ in PEOPLE],
+            "name": [name for _, name, _ in PEOPLE],
+            "score": [score for _, _, score in PEOPLE],
+        },
+        edges=[(0, 1), (1, 2)],
+    )
+    conn = zudb.connect(path, read_only=True)
+    yield conn
+    conn.close()
+
+
+@pytest.fixture
 def crowd(tmp_path: Path) -> zudb.Connection:
     """Enough people that a statement over the pairs of them takes long
     enough to time, which is what the threading tests need.
