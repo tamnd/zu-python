@@ -20,6 +20,7 @@ use zudb::{Config, Database, Interrupt};
 use crate::appender::Appender;
 use crate::columns;
 use crate::error::{closed, programming, to_py_err};
+use crate::html;
 use crate::interrupt;
 use crate::register;
 use crate::txn::Transaction;
@@ -570,6 +571,46 @@ impl Result {
             self.result.columns.len(),
             self.result.rows.len()
         )
+    }
+
+    /// The rows as an HTML table, which is what a notebook shows.
+    ///
+    /// Jupyter asks for this before it falls back to `repr`, so a
+    /// result in a cell is the rows and not a line about how many
+    /// there are. Only the first hundred are drawn and the note
+    /// underneath says how many there were, because a million rows of
+    /// markup is a notebook file nobody can open.
+    ///
+    /// Reading it does not move the cursor `fetchone` uses, for the
+    /// same reason iterating does not: a person who looked at a result
+    /// has not taken any of its rows.
+    fn _repr_html_(&self, py: Python<'_>) -> PyResult<String> {
+        let rows = &self.result.rows;
+        let columns = &self.result.columns;
+        if columns.is_empty() {
+            return Ok(html::wrap(
+                "<span class=\"zu-note\">no columns, which is what a statement that \
+                 writes gives back</span>",
+            ));
+        }
+        let mut out = String::from("<table class=\"zu-table\"><thead><tr>");
+        for name in columns {
+            out.push_str(&format!("<th>{}</th>", html::escape(name)));
+        }
+        out.push_str("</tr></thead><tbody>");
+        for row in rows.iter().take(html::SHOWN) {
+            out.push_str("<tr>");
+            for value in row {
+                out.push_str(&html::cell(&to_py(py, value, &self.names)?)?);
+            }
+            out.push_str("</tr>");
+        }
+        out.push_str("</tbody></table>");
+        out.push_str(&format!(
+            "<div class=\"zu-note\">{}</div>",
+            html::note(rows.len(), columns.len())
+        ));
+        Ok(html::wrap(&out))
     }
 }
 

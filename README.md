@@ -126,6 +126,26 @@ result.record_batches()  # a reader, for a result larger than memory
 
 `Result` implements `__arrow_c_stream__`, so anything that reads the protocol reads a result directly and none of the four methods above is needed: `pyarrow.table(result)` and `polars.DataFrame(result)` both work. Batches are 65,536 rows. A column holds one type, which the values decide, and integers beside floats are the one mixture that widens rather than being refused. Nodes, rels and paths go across as structs. The copy runs with the GIL released, and on this machine 300,000 rows across three columns take 44 ms as Arrow against 67 ms as Python objects, and a single integer column takes 13.8 ms against 44.5 ms.
 
+## In a notebook
+
+A result in a cell draws itself as a table, because Jupyter asks an object for `_repr_html_` before it falls back to `repr` and a line saying how many rows there are is a strictly worse answer than the rows. Nodes, rels and paths draw themselves too, a path as the walk it is: `(person #0) -[knows]-> (person #1)`.
+
+```python
+%load_ext zudb.magic
+%gql social.zu1
+```
+
+```python
+%%gql
+MATCH (p:person) WHERE p.score > 40 RETURN p.name AS name, p.score AS score
+```
+
+The cell is one statement, it runs on the current connection, and the result is the value of the cell, so `_` is a `zudb.Result` and everything a result can do is still there. `%gql` is about which connection and `%%gql` is about the statement, and neither guesses the other's job. A notebook that already called `zudb.connect` needs no `%gql` at all: if exactly one connection is lying about the namespace `%%gql` uses it, and if there is more than one it names them and asks which. `%%gql --conn other --params args --out rows` says which connection, where the parameters are, and where to put the result instead of showing it, each of them naming a variable because a notebook has the values already.
+
+The markup is a table, a stylesheet and no script, so it survives `nbconvert`, an exported HTML file and a notebook diff, and there is nothing to install for any of it. Colours come from the notebook through `currentColor` and opacity, because a light theme and a dark one are both in the room. Values are escaped, since a string column holding `<script>` is a string column and a client that pasted one into the page would run a caller's data as code in their notebook. The first hundred rows are drawn and the note underneath says how many there were, and a value longer than two hundred characters is cut with a mark where it was cut, because a million rows of markup is a notebook file that will not open again.
+
+IPython is not a dependency. It is what a notebook already has, and nothing here imports it until `%load_ext` does.
+
 ## Stopping a statement
 
 A statement that is running can be stopped two ways, and neither of them closes the connection: the session, its plans and its warm readers are all there afterwards, which is the whole difference between stopping a statement and starting again.
@@ -183,7 +203,7 @@ The stub is checked against the module it describes in CI: griffe reads the stub
 
 ## What works today
 
-The list above is what this client is for. What it does so far is the core of it: `connect`, `execute` and `sql` with named parameters, results that iterate and fetch, values as Python objects both ways including dates, times, datetimes and durations, `Node`, `Rel` and `Path` as classes, `load` for building a graph with edges in it, an appender for growing one, transactions as a context manager that commits at the end of a block and rolls back when it raises, every condition as an exception class carrying its code, its position and its documentation link, results as Arrow columns and as pandas and polars frames, `register` for putting a frame under a name a statement can match on and reading it where it lies, stubs inside the wheel with a gate that keeps them true, the GIL released around every statement, every load and every copy out, `Ctrl-C` and `interrupt()` stopping a statement without touching the connection under it, and `zudb.aio` for the same calls awaited on an event loop. A DB-API 2.0 wrapper is next, and each one lands with the tests that say it works.
+The list above is what this client is for. What it does so far is the core of it: `connect`, `execute` and `sql` with named parameters, results that iterate and fetch, values as Python objects both ways including dates, times, datetimes and durations, `Node`, `Rel` and `Path` as classes, `load` for building a graph with edges in it, an appender for growing one, transactions as a context manager that commits at the end of a block and rolls back when it raises, every condition as an exception class carrying its code, its position and its documentation link, results as Arrow columns and as pandas and polars frames, `register` for putting a frame under a name a statement can match on and reading it where it lies, stubs inside the wheel with a gate that keeps them true, the GIL released around every statement, every load and every copy out, `Ctrl-C` and `interrupt()` stopping a statement without touching the connection under it, `zudb.aio` for the same calls awaited on an event loop, and results, nodes, rels and paths that draw themselves in a notebook with `%gql` and `%%gql` to run statements in one. A DB-API 2.0 wrapper is next, and each one lands with the tests that say it works.
 
 ## Wheels
 

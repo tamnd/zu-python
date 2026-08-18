@@ -197,6 +197,9 @@ class Result:
     def __arrow_c_stream__(self, requested_schema: object | None = None) -> Any:
         """The rows as an Arrow stream, for anything that speaks Arrow."""
 
+    def _repr_html_(self) -> str:
+        """The rows as an HTML table, which is what a notebook shows."""
+
     def __len__(self) -> int: ...
     def __iter__(self) -> Iterator[tuple[Value, ...]]: ...
     def __repr__(self) -> str: ...
@@ -212,6 +215,9 @@ class Node:
     @property
     def offset(self) -> int:
         """The row this node sits at in that table, counting from zero."""
+
+    def _repr_html_(self) -> str:
+        """The node as a notebook draws it, which is the pair that names it."""
 
     def __hash__(self) -> int: ...
     def __repr__(self) -> str: ...
@@ -237,6 +243,9 @@ class Rel:
         """Where the edge's properties sit, which is its place in
         the order the table was loaded in."""
 
+    def _repr_html_(self) -> str:
+        """The edge as a notebook draws it, with the rows it joins on either side."""
+
     def __hash__(self) -> int: ...
     def __repr__(self) -> str: ...
 
@@ -255,6 +264,9 @@ class Path:
     @property
     def rels(self) -> list[Rel]:
         """The edges of the walk, in the order it crosses them."""
+
+    def _repr_html_(self) -> str:
+        """The walk as a notebook draws it, nodes and arrows alternating."""
 
     def __len__(self) -> int: ...
     def __repr__(self) -> str: ...
