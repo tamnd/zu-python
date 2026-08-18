@@ -1,0 +1,213 @@
+name: Wheels
+
+on:
+  workflow_dispatch:
+  push:
+    tags: ["v*"]
+  # A change to how a wheel is built is exercised on the pull request
+  # that makes it. The alternative is finding out on the tag, which is
+  # the one moment a wheel cannot be rebuilt quietly.
+  pull_request:
+    paths:
+      - .github/workflows/wheels.yml
+      - Cargo.toml
+      - pyproject.toml
+      - rust-toolchain.toml
+      - tools/wheel_tags.py
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  # Three wheels per platform, and the reason is CPython's rather than
+  # ours: the free-threaded build had no stable ABI until 3.15 and PEP
+  # 803's `abi3t`, so 3.14t is a version-specific wheel of its own and
+  # will be for as long as 3.14 is supported.
+  wheel:
+    name: ${{ matrix.abi }} ${{ matrix.platform }}
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        abi: [abi3, ft314, abi3t]
+        platform:
+          - manylinux_2_28_x86_64
+          - manylinux_2_28_aarch64
+          - musllinux_1_2_x86_64
+          - musllinux_1_2_aarch64
+          - macosx_universal2
+          - win_amd64
+          - win_arm64
+        include:
+          # Which ABI, which is a Cargo feature and an interpreter.
+          # `abi3` is the default feature, so the first row asks for
+          # nothing; the other two turn it off, because a wheel built
+          # against the stable ABI cannot also be built against one
+          # version's. `inside` is the same interpreter as `version` for
+          # the rows that build in a container, where the runner's
+          # Python is not visible and the image's own `python3` is
+          # whatever the image happens to ship.
+          - abi: abi3
+            tag: cp311-abi3
+            features: ""
+            version: "3.11"
+            freethreaded: false
+            inside: /opt/python/cp311-cp311/bin/python
+          - abi: ft314
+            tag: cp314-cp314t
+            features: "--no-default-features"
+            version: "3.14"
+            freethreaded: true
+            inside: /opt/python/cp314-cp314t/bin/python
+          - abi: abi3t
+            tag: cp315-abi3.abi3t
+            features: "--no-default-features --features abi3t"
+            version: "3.15-dev"
+            freethreaded: true
+            inside: /opt/python/cp315-cp315t/bin/python
+          # Which platform, which is a runner and a target. Every row
+          # is built on its own architecture: an emulated build takes
+          # twenty minutes to produce the same bytes. The Linux rows
+          # name their image rather than taking the default, because
+          # the default for musl is a cross image that carries four
+          # GIL-enabled interpreters and no free-threaded one, and the
+          # pypa images are the ones that carry every interpreter this
+          # matrix asks for under /opt/python.
+          - platform: manylinux_2_28_x86_64
+            runner: ubuntu-latest
+            target: x86_64
+            libc: "2_28"
+            image: quay.io/pypa/manylinux_2_28_x86_64
+            installable: true
+          - platform: manylinux_2_28_aarch64
+            runner: ubuntu-24.04-arm
+            target: aarch64
+            libc: "2_28"
+            image: quay.io/pypa/manylinux_2_28_aarch64
+            installable: true
+          - platform: musllinux_1_2_x86_64
+            runner: ubuntu-latest
+            target: x86_64
+            libc: musllinux_1_2
+            image: quay.io/pypa/musllinux_1_2_x86_64
+            installable: false
+          - platform: musllinux_1_2_aarch64
+            runner: ubuntu-24.04-arm
+            target: aarch64
+            libc: musllinux_1_2
+            image: quay.io/pypa/musllinux_1_2_aarch64
+            installable: false
+          - platform: macosx_universal2
+            runner: macos-latest
+            target: universal2-apple-darwin
+            libc: auto
+            image: ""
+            installable: true
+          - platform: win_amd64
+            runner: windows-latest
+            target: x64
+            libc: auto
+            image: ""
+            installable: true
+          - platform: win_arm64
+            runner: windows-11-arm
+            target: aarch64-pc-windows-msvc
+            libc: auto
+            image: ""
+            installable: true
+    steps:
+      - uses: actions/checkout@v7
+      # The interpreter maturin names the wheel after on macOS and
+      # Windows, and the one that installs it below everywhere it can
+      # be installed. The Linux rows build inside the manylinux and
+      # musllinux images, which carry their own.
+      - uses: actions/setup-python@v6
+        with:
+          python-version: ${{ matrix.version }}
+          freethreaded: ${{ matrix.freethreaded }}
+      - uses: PyO3/maturin-action@v1
+        with:
+          target: ${{ matrix.target }}
+          manylinux: ${{ matrix.libc }}
+          container: ${{ matrix.image || 'auto' }}
+          # Named rather than left to the toolchain file, which the
+          # build container does not read.
+          rust-toolchain: 1.97.1
+          # The interpreter, named, on the rows that build in a
+          # container. Left to the path everywhere else, where
+          # setup-python above put the row's interpreter first. An
+          # unnamed interpreter is how the first run of this workflow
+          # built four Linux wheels for the image's own Python 3.12.
+          args: >-
+            --release --out dist ${{ matrix.features }}
+            ${{ matrix.image != '' && format('-i {0}', matrix.inside) || '' }}
+          # Which interpreters the image carries, which is the first
+          # thing worth reading when a row builds the wrong wheel, and
+          # then the one this row asked for, so that a missing
+          # interpreter fails here rather than further down. The
+          # extension is a shared object and a static C runtime cannot
+          # be linked into one, which is the musl default and a no-op
+          # everywhere else.
+          before-script-linux: |
+            ls -1 /opt/python
+            test -x ${{ matrix.inside }}
+            export RUSTFLAGS="-C target-feature=-crt-static"
+      # The wheel is named by the interpreter that built it and by
+      # nothing that was checked, so this checks it: the tag has to be
+      # the one this row asked for. A build that fell back to a
+      # version-specific wheel produces a wheel that works and claims
+      # nothing about any version but its own.
+      - run: python tools/wheel_tags.py dist ${{ matrix.tag }} ${{ matrix.platform }}
+      - name: the wheel imports
+        if: matrix.installable
+        run: |
+          python -m pip install --no-index --find-links dist zudb
+          python -c "import zudb; print(zudb.__version__, zudb.__abi_version__)"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wheel-${{ matrix.abi }}-${{ matrix.platform }}
+          path: dist/*.whl
+
+  # Every platform with no row above, and the one everybody who
+  # packages this for something else starts from. Built once, from the
+  # same checkout, and tested by building it back into a wheel.
+  sdist:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: PyO3/maturin-action@v1
+        with:
+          command: sdist
+          args: --out dist
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.14"
+      - run: pip install --no-binary zudb dist/*.tar.gz
+      - run: python -c "import zudb; print(zudb.__version__)"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: sdist
+          path: dist/*.tar.gz
+
+  # The grid, checked as a grid. Every cell filled and nothing outside
+  # it, which is the check a single row cannot do.
+  tags:
+    needs: [wheel, sdist]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.14"
+      - run: python tools/wheel_tags.py dist
