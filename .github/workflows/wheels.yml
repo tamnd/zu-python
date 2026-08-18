@@ -50,59 +50,77 @@ jobs:
           # `abi3` is the default feature, so the first row asks for
           # nothing; the other two turn it off, because a wheel built
           # against the stable ABI cannot also be built against one
-          # version's.
+          # version's. `inside` is the same interpreter as `version` for
+          # the rows that build in a container, where the runner's
+          # Python is not visible and the image's own `python3` is
+          # whatever the image happens to ship.
           - abi: abi3
             tag: cp311-abi3
             features: ""
-            interpreter: "3.11"
+            version: "3.11"
             freethreaded: false
+            inside: /opt/python/cp311-cp311/bin/python
           - abi: ft314
             tag: cp314-cp314t
             features: "--no-default-features"
-            interpreter: "3.14"
+            version: "3.14"
             freethreaded: true
+            inside: /opt/python/cp314-cp314t/bin/python
           - abi: abi3t
-            tag: cp315-abi3t
+            tag: cp315-abi3.abi3t
             features: "--no-default-features --features abi3t"
-            interpreter: "3.15-dev"
+            version: "3.15-dev"
             freethreaded: true
+            inside: /opt/python/cp315-cp315t/bin/python
           # Which platform, which is a runner and a target. Every row
           # is built on its own architecture: an emulated build takes
-          # twenty minutes to produce the same bytes.
+          # twenty minutes to produce the same bytes. The Linux rows
+          # name their image rather than taking the default, because
+          # the default for musl is a cross image that carries four
+          # GIL-enabled interpreters and no free-threaded one, and the
+          # pypa images are the ones that carry every interpreter this
+          # matrix asks for under /opt/python.
           - platform: manylinux_2_28_x86_64
             runner: ubuntu-latest
             target: x86_64
-            container: "2_28"
+            libc: "2_28"
+            image: quay.io/pypa/manylinux_2_28_x86_64
             installable: true
           - platform: manylinux_2_28_aarch64
             runner: ubuntu-24.04-arm
             target: aarch64
-            container: "2_28"
+            libc: "2_28"
+            image: quay.io/pypa/manylinux_2_28_aarch64
             installable: true
           - platform: musllinux_1_2_x86_64
             runner: ubuntu-latest
             target: x86_64
-            container: musllinux_1_2
+            libc: musllinux_1_2
+            image: quay.io/pypa/musllinux_1_2_x86_64
             installable: false
           - platform: musllinux_1_2_aarch64
             runner: ubuntu-24.04-arm
             target: aarch64
-            container: musllinux_1_2
+            libc: musllinux_1_2
+            image: quay.io/pypa/musllinux_1_2_aarch64
             installable: false
           - platform: macosx_universal2
             runner: macos-latest
             target: universal2-apple-darwin
-            container: auto
+            libc: auto
+            image: ""
             installable: true
           - platform: win_amd64
             runner: windows-latest
             target: x64
-            container: auto
+            libc: auto
+            image: ""
             installable: true
           - platform: win_arm64
             runner: windows-11-arm
             target: aarch64-pc-windows-msvc
-            container: auto
+            libc: auto
+            image: ""
             installable: true
     steps:
       - uses: actions/checkout@v7
@@ -112,16 +130,35 @@ jobs:
       # musllinux images, which carry their own.
       - uses: actions/setup-python@v6
         with:
-          python-version: ${{ matrix.interpreter }}
+          python-version: ${{ matrix.version }}
           freethreaded: ${{ matrix.freethreaded }}
       - uses: PyO3/maturin-action@v1
         with:
           target: ${{ matrix.target }}
-          manylinux: ${{ matrix.container }}
+          manylinux: ${{ matrix.libc }}
+          container: ${{ matrix.image || 'auto' }}
           # Named rather than left to the toolchain file, which the
           # build container does not read.
           rust-toolchain: 1.97.1
-          args: --release --out dist ${{ matrix.features }}
+          # The interpreter, named, on the rows that build in a
+          # container. Left to the path everywhere else, where
+          # setup-python above put the row's interpreter first. An
+          # unnamed interpreter is how the first run of this workflow
+          # built four Linux wheels for the image's own Python 3.12.
+          args: >-
+            --release --out dist ${{ matrix.features }}
+            ${{ matrix.image != '' && format('-i {0}', matrix.inside) || '' }}
+          # Which interpreters the image carries, which is the first
+          # thing worth reading when a row builds the wrong wheel, and
+          # then the one this row asked for, so that a missing
+          # interpreter fails here rather than further down. The
+          # extension is a shared object and a static C runtime cannot
+          # be linked into one, which is the musl default and a no-op
+          # everywhere else.
+          before-script-linux: |
+            ls -1 /opt/python
+            test -x ${{ matrix.inside }}
+            export RUSTFLAGS="-C target-feature=-crt-static"
       # The wheel is named by the interpreter that built it and by
       # nothing that was checked, so this checks it: the tag has to be
       # the one this row asked for. A build that fell back to a

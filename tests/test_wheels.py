@@ -50,10 +50,28 @@ def test_a_missing_wheel_is_named() -> None:
 
 
 def test_a_missing_abi_is_named_once_per_platform() -> None:
-    built = [name for name in grid() if "cp315-abi3t" not in name]
+    built = [name for name in grid() if "cp315-abi3.abi3t" not in name]
     complaints = wheel_tags.check(built)
     assert len(complaints) == 7
-    assert all("no cp315-abi3t wheel" in complaint for complaint in complaints)
+    assert all("no cp315-abi3.abi3t wheel" in complaint for complaint in complaints)
+
+
+def test_the_two_abi_tags_of_the_3_15_wheel_are_a_set_and_not_an_order() -> None:
+    # What maturin writes is `abi3.abi3t`, and a release is not the
+    # place to care which of the two it wrote first.
+    built = [name.replace("cp315-abi3.abi3t", "cp315-abi3t.abi3") for name in grid()]
+    assert wheel_tags.check(built) == []
+
+
+def test_the_stable_abi_alone_is_not_the_free_threaded_one() -> None:
+    # `abi3-py315` instead of `abi3t-py315` builds a wheel that installs
+    # on 3.15 and every later 3.x and refuses to load on the
+    # free-threaded build of any of them, which is half the row and
+    # reads in the name as one tag short.
+    built = [name.replace("cp315-abi3.abi3t", "cp315-abi3") for name in grid()]
+    complaints = wheel_tags.check(built)
+    assert len(complaints) == 14
+    assert complaints[0].endswith("and nothing else")
 
 
 def test_a_version_specific_wheel_nobody_asked_for_is_refused() -> None:
@@ -144,6 +162,22 @@ def test_a_build_that_found_the_wrong_interpreter_is_caught_where_it_happened() 
         f"zudb-{VERSION}-cp313-cp313-manylinux_2_28_x86_64.whl is a cp313-cp313 wheel "
         "and this build asked for cp314-cp314t"
     ]
+
+
+def test_a_row_that_built_against_the_wrong_stable_abi_is_caught_too() -> None:
+    # The 3.15 row asks for both tags and a build that produced one of
+    # them found `abi3-py315` where `abi3t-py315` was meant, which is a
+    # wheel the free-threaded interpreter will not load.
+    built = [f"zudb-{VERSION}-cp315-abi3-manylinux_2_28_x86_64.whl"]
+    assert wheel_tags.check_one(built, "cp315-abi3.abi3t", "manylinux_2_28_x86_64") == [
+        f"zudb-{VERSION}-cp315-abi3-manylinux_2_28_x86_64.whl is a cp315-abi3 wheel "
+        "and this build asked for cp315-abi3.abi3t"
+    ]
+
+
+def test_a_row_that_built_both_tags_in_the_other_order_is_the_row_it_asked_for() -> None:
+    built = [f"zudb-{VERSION}-cp315-abi3t.abi3-win_amd64.whl"]
+    assert wheel_tags.check_one(built, "cp315-abi3.abi3t", "win_amd64") == []
 
 
 def test_a_build_for_another_platform_is_caught_too() -> None:

@@ -80,13 +80,13 @@ The list above is what this client is for. What it does so far is the core of it
 
 ## Wheels
 
-Three per platform, which is more than it sounds like it should be and is not optional. The free-threaded CPython build has no stable ABI until 3.15 and [PEP 803](https://peps.python.org/pep-0803/)'s `abi3t`, so 3.14t needs a version-specific wheel of its own.
+Three per platform, which is more than it sounds like it should be and is not optional. The free-threaded CPython build has no stable ABI until 3.15 and [PEP 803](https://peps.python.org/pep-0803/)'s `abi3t`, so 3.14t needs a version-specific wheel of its own. From 3.15 one wheel serves both builds and carries both ABI tags, which is what PEP 803 is for and the reason this stops at three.
 
 | Tag | Covers |
 |---|---|
 | `cp311-abi3` | CPython 3.11 through 3.14, GIL-enabled |
 | `cp314-cp314t` | free-threaded 3.14 |
-| `cp315-abi3t` | 3.15 and every later 3.x, both builds |
+| `cp315-abi3.abi3t` | 3.15 and every later 3.x, both builds |
 
 Platforms: manylinux_2_28 and musllinux on x86_64 and aarch64, macOS universal2, Windows x64 and arm64. An `sdist` that builds with only a Rust toolchain is published too, and is built back into a wheel in CI.
 

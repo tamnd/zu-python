@@ -3,7 +3,10 @@
 Three wheels per platform, which is more than it sounds like it should
 be and is not optional: the free-threaded build has no stable ABI until
 CPython 3.15 and PEP 803's `abi3t`, so 3.14t needs a version-specific
-wheel of its own. Three, and no more than three. A version-specific
+wheel of its own. From 3.15 one wheel serves both builds and says so in
+two ABI tags at once, `cp315-abi3.abi3t`, which is the whole point of
+PEP 803 and the reason this stops at three rather than growing a fourth.
+Three, and no more than three. A version-specific
 wheel nobody asked for is what happens when a build finds the wrong
 interpreter and quietly falls back, and the failure is silent in every
 other way: the wheel installs, it works on the machine that built it,
@@ -28,7 +31,7 @@ from pathlib import Path
 ABIS = {
     "cp311-abi3": "the stable ABI, CPython 3.11 through 3.14",
     "cp314-cp314t": "free-threaded 3.14, which has no stable ABI",
-    "cp315-abi3t": "the free-threaded stable ABI, 3.15 and every later 3.x",
+    "cp315-abi3.abi3t": "the stable ABI from 3.15, GIL-enabled and free-threaded at once",
 }
 
 #: The platforms, as patterns rather than strings, because the macOS
@@ -50,6 +53,30 @@ PLATFORMS = {
 SDIST = re.compile(r"^zudb-[^-]+\.tar\.gz$")
 
 WHEEL = re.compile(r"^zudb-[^-]+-([^-]+-[^-]+)-(.+)\.whl$")
+
+
+def members(tag: str) -> tuple[str, frozenset[str]]:
+    """A `{python tag}-{abi tag}` as what it means: the interpreter it
+    starts from, and the set of ABIs it claims."""
+    python, _, abis = tag.partition("-")
+    return python, frozenset(abis.split("."))
+
+
+def abi_of(tag: str) -> str | None:
+    """Which ABI a tag is, or `None` for one this release does not build.
+
+    An ABI tag is a set, dots between its members, the same way a
+    platform tag is, and PEP 803's wheel is where that stops being a
+    detail: it arrives as `cp315-abi3.abi3t`, which is one wheel saying
+    it is the stable ABI for the GIL-enabled build and for the
+    free-threaded build at once. Which member maturin writes first is
+    not something to hold a release to, so the set is what is compared,
+    and a wheel that claims only one of the two is not this one.
+    """
+    for name in ABIS:
+        if members(tag) == members(name):
+            return name
+    return None
 
 
 def platform_of(tag: str) -> str | None:
@@ -85,7 +112,8 @@ def check(names: list[str]) -> list[str]:
             complaints.append(f"{name} is neither a wheel of this project nor its sdist")
             continue
         abi, platform = found.group(1), found.group(2)
-        if abi not in ABIS:
+        which = abi_of(abi)
+        if which is None:
             wanted = ", ".join(ABIS)
             complaints.append(
                 f"{name} is a {abi} wheel, and this release builds {wanted} and nothing else"
@@ -97,7 +125,7 @@ def check(names: list[str]) -> list[str]:
                 f"{name} is for {platform}, which is not a platform this release builds for"
             )
             continue
-        built.setdefault((abi, where), []).append(name)
+        built.setdefault((which, where), []).append(name)
 
     for abi, what in ABIS.items():
         for platform in PLATFORMS:
@@ -133,7 +161,7 @@ def check_one(names: list[str], abi: str, platform: str) -> list[str]:
         found = WHEEL.fullmatch(name)
         if not found:
             complaints.append(f"{name} is not a wheel of this project")
-        elif found.group(1) != abi:
+        elif abi_of(found.group(1)) != abi:
             complaints.append(f"{name} is a {found.group(1)} wheel and this build asked for {abi}")
         elif platform_of(found.group(2)) != platform:
             complaints.append(f"{name} is for {found.group(2)} and this build asked for {platform}")
