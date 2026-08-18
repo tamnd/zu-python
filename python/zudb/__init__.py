@@ -11,9 +11,10 @@ The engine is compiled into the wheel, so there is nothing to install,
 nothing to run, and no server to connect to. Statements are ISO/IEC
 39075 GQL.
 
-On an event loop the same calls are awaited, from `zudb.aio`. It is a
-submodule to ask for by name rather than one imported here, so a script
-that never awaits anything pays for none of it.
+On an event loop the same calls are awaited, from `zudb.aio`. Code
+written against PEP 249 gets what it expects from `zudb.dbapi`. Both
+are submodules to ask for by name rather than ones imported here, so a
+script that uses neither pays for neither.
 """
 
 from __future__ import annotations

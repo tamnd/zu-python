@@ -122,6 +122,16 @@ def test_the_event_loop_module_is_not_imported_by_importing_this_one() -> None:
     assert done.stdout.strip() == "False False"
 
 
+def test_the_dbapi_module_is_not_imported_by_importing_this_one() -> None:
+    """`zudb.dbapi` is a submodule a caller asks for by name too.
+
+    It is there for code written against PEP 249, which is not most
+    code, and the package that everyone imports should not carry it.
+    """
+    done = run("import sys, zudb; print('zudb.dbapi' in sys.modules)")
+    assert done.stdout.strip() == "False"
+
+
 def test_pyarrow_arrives_when_a_result_is_asked_for_its_columns(tmp_path: Path) -> None:
     pytest.importorskip("pyarrow")
     path = tmp_path / "columns.zu1"

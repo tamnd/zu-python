@@ -189,6 +189,26 @@ Cancelling the task that awaits a statement interrupts the statement. The engine
 
 `transaction()` and `appender()` are opened with `async with`, `in_transaction()` and `registered()` are methods here because both answers live behind the lock, and everything else is the sync call with an `await` in front of it.
 
+## Through the DB-API
+
+PEP 249 is what a Python program expects a database to look like, and the code that expects it is not always code anyone can change: a dashboard, a test harness, a helper somebody wrote against sqlite3 five years ago. `zudb.dbapi` is that shape, over the same connection.
+
+```python
+import zudb.dbapi
+
+with zudb.dbapi.connect("social.zu1") as conn:
+    cur = conn.cursor()
+    cur.execute("INSERT (p:person {uid: 1, name: 'ada', score: 41.0})")
+    cur.execute("MATCH (p:person) WHERE p.score > ? RETURN p.name AS name", (40,))
+    print(cur.fetchall())
+```
+
+Parameters are `?`, which PEP 249 calls `qmark`, rewritten into the engine's own `$name` before the statement runs. The `named` style cannot work here: `:name` is how a pattern names a label, so `(p:person)` and `WHERE p.uid = :uid` cannot be told apart without parsing the statement, while `?` is a character GQL has no meaning for anywhere. A question mark inside a string, a quoted name or a comment is text somebody wrote and is left alone, and passing a dict instead of a sequence hands the statement over untouched, so `$name` still works for anyone writing zu statements rather than generating them.
+
+Transactions are implicit, which PEP 249 requires and the native client does not do: one opens before the first statement after each `commit` or `rollback`, and closing a connection rolls back what was not committed. `connect(..., autocommit=True)` turns that off and gives back the native behaviour, where every statement stands alone.
+
+The exception classes are both hierarchies at once. `zudb.Error` is the `Error` PEP 249 asks for, and a syntax error is a `zudb.SyntaxError` and a `dbapi.ProgrammingError` and the same object, carrying the same code, position and documentation link, so a driver-shaped library and code written against this client can catch the same failure in the same program. `cur.description` names the columns and gives the Python type of what is in them, read from the first rows, since a result declares no types of its own. `conn.zu` is the connection underneath and `cur.result` is the result the last statement gave back, so appenders, registered frames, `interrupt()` and `to_arrow()` are all still there. It is a layer, not a second client.
+
 ## When a program is wrong
 
 Every condition arrives as an exception class carrying its GQLSTATUS code, its position and a link to what the standard says about it, and the class is the class a Python caller would have written: a mistake the program made is a `zudb.ProgrammingError`, a value Python has and zu does not is a `TypeError`, a value of the right type and the wrong shape is a `ValueError`, and a file that is not a database is a `zudb.ConnectionError`, the same as a file that is not there. Both of those are a path that does not lead to a database, and telling a caller who mistyped one to file a bug would be the wrong answer twice.
@@ -203,7 +223,7 @@ The stub is checked against the module it describes in CI: griffe reads the stub
 
 ## What works today
 
-The list above is what this client is for. What it does so far is the core of it: `connect`, `execute` and `sql` with named parameters, results that iterate and fetch, values as Python objects both ways including dates, times, datetimes and durations, `Node`, `Rel` and `Path` as classes, `load` for building a graph with edges in it, an appender for growing one, transactions as a context manager that commits at the end of a block and rolls back when it raises, every condition as an exception class carrying its code, its position and its documentation link, results as Arrow columns and as pandas and polars frames, `register` for putting a frame under a name a statement can match on and reading it where it lies, stubs inside the wheel with a gate that keeps them true, the GIL released around every statement, every load and every copy out, `Ctrl-C` and `interrupt()` stopping a statement without touching the connection under it, `zudb.aio` for the same calls awaited on an event loop, and results, nodes, rels and paths that draw themselves in a notebook with `%gql` and `%%gql` to run statements in one. A DB-API 2.0 wrapper is next, and each one lands with the tests that say it works.
+The list above is what this client is for. What it does so far is the core of it: `connect`, `execute` and `sql` with named parameters, results that iterate and fetch, values as Python objects both ways including dates, times, datetimes and durations, `Node`, `Rel` and `Path` as classes, `load` for building a graph with edges in it, an appender for growing one, transactions as a context manager that commits at the end of a block and rolls back when it raises, every condition as an exception class carrying its code, its position and its documentation link, results as Arrow columns and as pandas and polars frames, `register` for putting a frame under a name a statement can match on and reading it where it lies, stubs inside the wheel with a gate that keeps them true, the GIL released around every statement, every load and every copy out, `Ctrl-C` and `interrupt()` stopping a statement without touching the connection under it, `zudb.aio` for the same calls awaited on an event loop, results, nodes, rels and paths that draw themselves in a notebook with `%gql` and `%%gql` to run statements in one, and `zudb.dbapi` for code written against PEP 249. Each one landed with the tests that say it works.
 
 ## Wheels
 
