@@ -531,7 +531,8 @@ impl Buffer {
 /// a rel table, which is nothing beside the commit either of them is
 /// about to do.
 fn catalog(engine: &mut zudb::Connection) -> Result<Catalog, Snag> {
-    Catalog::load(engine.session_mut().file_mut()).map_err(Snag::Engine)
+    let file = engine.session_mut().file_mut().map_err(Snag::Engine)?;
+    Catalog::load(file).map_err(Snag::Engine)
 }
 
 /// The columns of the table an appender was opened on, in the order it
@@ -584,7 +585,8 @@ fn shape(engine: &mut zudb::Connection, table: &str) -> Result<Vec<Buffer>, Snag
                 "no node table or rel table '{table}'"
             )))
         })?;
-    let directory = zudb::zu1::props::load_props(engine.session_mut().file_mut(), id)
+    let file = engine.session_mut().file_mut().map_err(Snag::Engine)?;
+    let directory = zudb::zu1::props::load_props(file, id)
         .map_err(Snag::Engine)?
         .ok_or_else(|| {
             Snag::Engine(ZuError::InvalidArgument(format!(

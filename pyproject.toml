@@ -65,8 +65,10 @@ strip = true
 testpaths = ["tests"]
 addopts = "-q"
 # `tools` holds the checks the release job runs, which are tested here
-# rather than only on the tag that would fail because of one.
-pythonpath = ["tools"]
+# rather than only on the tag that would fail because of one, and `.`
+# holds `conformance`, which is a development tool rather than something
+# the wheel ships.
+pythonpath = ["tools", "."]
 
 [tool.ruff]
 target-version = "py311"
