@@ -454,8 +454,11 @@ def test_appending_beats_inserting_by_the_margin_that_makes_it_worth_having(
 
     # Measured at about 150 times on this machine at this row count and
     # rising with it, since one commit is one commit however many rows
-    # it carries. The gate is 20, which is the number that says the
-    # appender is still batching rather than the number it hits.
-    assert inserting > 20 * appending, (
+    # it carries. It is 18 on a shared CI runner, where a commit costs
+    # 25 ms of somebody else's disk and the appender's single one is
+    # most of what it spends, so the gate is 5: the number that says the
+    # appender is still batching rather than the number either machine
+    # hits.
+    assert inserting > 5 * appending, (
         f"{COMPARED} rows: {inserting * 1000:.0f} ms inserted, {appending * 1000:.0f} ms appended"
     )
