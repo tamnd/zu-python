@@ -85,6 +85,20 @@ result.record_batches()  # a reader, for a result larger than memory
 
 `Result` implements `__arrow_c_stream__`, so anything that reads the protocol reads a result directly and none of the four methods above is needed: `pyarrow.table(result)` and `polars.DataFrame(result)` both work. Batches are 65,536 rows. A column holds one type, which the values decide, and integers beside floats are the one mixture that widens rather than being refused. Nodes, rels and paths go across as structs. The copy runs with the GIL released, and on this machine 300,000 rows across three columns take 44 ms as Arrow against 67 ms as Python objects, and a single integer column takes 13.8 ms against 44.5 ms.
 
+## Stopping a statement
+
+A statement that is running can be stopped two ways, and neither of them closes the connection: the session, its plans and its warm readers are all there afterwards, which is the whole difference between stopping a statement and starting again.
+
+```python
+conn.execute(long_one)  # Ctrl-C raises KeyboardInterrupt here
+conn.interrupt()  # from another thread, raises zudb.Interrupted there
+conn.rows_read  # how far the statement running now has got
+```
+
+`Ctrl-C` is the one a person presses, and it raises `KeyboardInterrupt` on the thread that called `execute`, measured at 5 ms from the press on this machine against a budget of 50. Python only delivers a signal to the main thread between two bytecodes, so a statement called from the main thread runs on a thread this client keeps for it and the main thread waits and asks for signals while it does. That thread is kept rather than made per statement, because making one costs 30 microseconds against a small statement that costs 10, and a statement called from any other thread runs inline where a signal was never going to arrive anyway.
+
+`interrupt()` is the one a program calls, from a thread that is not the one inside `execute`, and it raises `zudb.Interrupted` there. It is one of the three calls that may be made on a connection while a statement is running, with `rows_read` and `closed`, and none of the three waits for it: a progress bar drawn from `rows_read` is a poll of an atomic, not a queue behind the executor.
+
 ## Types
 
 The wheel carries `py.typed` and a stub for the compiled module, so mypy, pyright and an editor's completion all work with nothing else installed. `zudb.Value` is the union a row holds and a parameter takes, for code that passes rows around and wants to say so.
@@ -93,7 +107,7 @@ The stub is checked against the module it describes in CI: griffe reads the stub
 
 ## What works today
 
-The list above is what this client is for. What it does so far is the core of it: `connect`, `execute` and `sql` with named parameters, results that iterate and fetch, values as Python objects both ways including dates, times, datetimes and durations, `Node`, `Rel` and `Path` as classes, `load` for building a graph with edges in it, an appender for growing one, every condition as an exception class carrying its code, its position and its documentation link, results as Arrow columns and as pandas and polars frames, stubs inside the wheel with a gate that keeps them true, and the GIL released around every statement, every load and every copy out. `register` and the interrupt are next, and each one lands with the tests that say it works.
+The list above is what this client is for. What it does so far is the core of it: `connect`, `execute` and `sql` with named parameters, results that iterate and fetch, values as Python objects both ways including dates, times, datetimes and durations, `Node`, `Rel` and `Path` as classes, `load` for building a graph with edges in it, an appender for growing one, every condition as an exception class carrying its code, its position and its documentation link, results as Arrow columns and as pandas and polars frames, stubs inside the wheel with a gate that keeps them true, the GIL released around every statement, every load and every copy out, and `Ctrl-C` and `interrupt()` stopping a statement without touching the connection under it. `register` is next, and each one lands with the tests that say it works.
 
 ## Wheels
 

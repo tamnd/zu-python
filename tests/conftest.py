@@ -77,6 +77,29 @@ def loaded(tmp_path: Path) -> zudb.Connection:
 
 
 @pytest.fixture
+def throng(tmp_path: Path) -> zudb.Connection:
+    """Enough people that the statement over the pairs of them runs for
+    about ten seconds, which is the statement the milestone asks to be
+    interruptible.
+
+    Loaded rather than inserted because twelve thousand rows one
+    statement at a time is twelve thousand commits, and this is a
+    fixture rather than the thing under test.
+    """
+    path = tmp_path / "throng.zu1"
+    zudb.load(
+        path,
+        nodes="person",
+        rels="knows",
+        columns={"uid": list(range(12_000))},
+        edges=[(0, 1)],
+    )
+    conn = zudb.connect(path, read_only=True)
+    yield conn
+    conn.close()
+
+
+@pytest.fixture
 def crowd(tmp_path: Path) -> zudb.Connection:
     """Enough people that a statement over the pairs of them takes long
     enough to time, which is what the threading tests need.

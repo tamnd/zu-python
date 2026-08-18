@@ -17,6 +17,7 @@ mod buffer;
 mod columns;
 mod conn;
 mod error;
+mod interrupt;
 mod load;
 mod value;
 
