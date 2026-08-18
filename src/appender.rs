@@ -396,10 +396,28 @@ impl Appender {
 
     /// The buffers, for a call that adds to them, which a closed
     /// appender has no business doing.
+    ///
+    /// The connection is checked as well as the appender, because a row
+    /// appended through a closed connection has nowhere to go and the
+    /// buffer is the only thing that would take it. Left to the flush,
+    /// the same call would be refused or not depending on whether the
+    /// batch happened to fill, which is a rule nobody can hold in their
+    /// head. It is refused here instead, at the call that made the
+    /// mistake, whatever the buffer is holding.
     fn writable(&self, py: Python<'_>) -> PyResult<MutexGuard<'_, State>> {
         let state = self.locked(py)?;
         if !state.open {
             return Err(Snag::Finished.raise(py));
+        }
+        if self
+            .conn
+            .bind(py)
+            .borrow()
+            .inner
+            .lock()
+            .is_ok_and(|c| c.is_none())
+        {
+            return Err(Snag::Closed.raise(py));
         }
         Ok(state)
     }
