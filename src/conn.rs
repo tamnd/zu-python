@@ -7,16 +7,23 @@
 //! to run statements at once want two connections. It is there so that
 //! a program which shares one by accident waits rather than corrupts.
 
+use std::ffi::CStr;
 use std::path::PathBuf;
 use std::sync::Mutex;
 
 use pyo3::prelude::*;
-use pyo3::types::{PyDict, PyList, PyTuple};
+use pyo3::types::{PyCapsule, PyDict, PyList, PyTuple};
 use zudb::query::{QueryResult, Value};
 use zudb::{Config, Database};
 
+use crate::columns;
 use crate::error::{closed, to_py_err};
 use crate::value::{Names, from_py, to_py};
+
+/// What a capsule holding an Arrow stream is called. The name is part
+/// of the protocol: a consumer checks it before it reads the pointer,
+/// and a capsule named anything else is not one of these.
+const STREAM: &CStr = c"arrow_array_stream";
 
 /// One connection to one database.
 ///
@@ -254,6 +261,75 @@ impl Result {
         Ok(out)
     }
 
+    /// The rows as an Arrow stream, for anything that speaks Arrow.
+    ///
+    /// This is the PyCapsule interface, which is how a producer hands
+    /// Arrow data to a consumer without either of them importing the
+    /// other: what comes back is a capsule holding an
+    /// `ArrowArrayStream`, and `pyarrow.table(result)`,
+    /// `polars.from_arrow(result)` and anything else that reads Arrow
+    /// takes it from here. `requested_schema` is accepted and ignored,
+    /// which the protocol allows: a result has the types it has, and
+    /// casting them here would hide a conversion a caller can see.
+    #[pyo3(signature = (requested_schema = None))]
+    fn __arrow_c_stream__<'py>(
+        &self,
+        py: Python<'py>,
+        requested_schema: Option<Bound<'py, PyAny>>,
+    ) -> PyResult<Bound<'py, PyCapsule>> {
+        let _ = requested_schema;
+        // Released for the copy: filling Arrow buffers out of engine
+        // values touches no Python object, and a result worth putting
+        // in a DataFrame is big enough that another thread should get
+        // to run while it happens.
+        let stream = py
+            .detach(|| columns::stream(&self.result, &self.names))
+            .map_err(|snag| snag.raise(py))?;
+        PyCapsule::new_with_value(py, stream, STREAM)
+    }
+
+    /// The rows as a `pyarrow.Table`.
+    fn to_arrow<'py>(slf: PyRef<'py, Self>) -> PyResult<Bound<'py, PyAny>> {
+        let py = slf.py();
+        needed(py, "pyarrow", "arrow")?.call_method1("table", (slf,))
+    }
+
+    /// The rows as a `pandas.DataFrame`, with Arrow-backed dtypes.
+    ///
+    /// `ArrowDtype` rather than the NumPy dtypes pandas grew up with,
+    /// because the data is already Arrow and converting it to NumPy
+    /// would copy every column to lose null support on the way. It is
+    /// also what pandas 3 wants.
+    fn to_pandas<'py>(slf: PyRef<'py, Self>) -> PyResult<Bound<'py, PyAny>> {
+        let py = slf.py();
+        let pandas = needed(py, "pandas", "pandas")?;
+        let how = PyDict::new(py);
+        how.set_item("types_mapper", pandas.getattr("ArrowDtype")?)?;
+        Self::to_arrow(slf)?.call_method("to_pandas", (), Some(&how))
+    }
+
+    /// The rows as a `polars.DataFrame`.
+    ///
+    /// The constructor rather than `from_arrow`, because `from_arrow`
+    /// on a stream is what polars 2 is going to hand back a `Series`
+    /// for, and a result is a table however many columns it has.
+    fn to_polars<'py>(slf: PyRef<'py, Self>) -> PyResult<Bound<'py, PyAny>> {
+        let py = slf.py();
+        needed(py, "polars", "polars")?.call_method1("DataFrame", (slf,))
+    }
+
+    /// The rows as a `pyarrow.RecordBatchReader`, a batch at a time.
+    ///
+    /// The same data as `to_arrow`, handed over in batches of sixty-five
+    /// thousand rows instead of as one table, which is what a consumer
+    /// that writes as it reads wants.
+    fn record_batches<'py>(slf: PyRef<'py, Self>) -> PyResult<Bound<'py, PyAny>> {
+        let py = slf.py();
+        needed(py, "pyarrow", "arrow")?
+            .getattr("RecordBatchReader")?
+            .call_method1("from_stream", (slf,))
+    }
+
     fn __len__(&self) -> usize {
         self.result.rows.len()
     }
@@ -281,6 +357,25 @@ impl Result {
                 .collect::<PyResult<Vec<_>>>()?,
         )
     }
+}
+
+/// A module the caller has to have installed for this call, imported.
+///
+/// A missing one is reported as the install that fixes it rather than
+/// as `ModuleNotFoundError: No module named 'pyarrow'`, which is true
+/// and says nothing about what to do. An import that fails for any
+/// other reason is raised as it is, because a broken pandas is not a
+/// missing one.
+fn needed<'py>(py: Python<'py>, module: &str, extra: &str) -> PyResult<Bound<'py, PyModule>> {
+    PyModule::import(py, module).map_err(|err| {
+        if err.is_instance_of::<pyo3::exceptions::PyImportError>(py) {
+            pyo3::exceptions::PyImportError::new_err(format!(
+                "this needs {module}, which is not installed: pip install 'zudb[{extra}]'"
+            ))
+        } else {
+            err
+        }
+    })
 }
 
 /// The parameter dictionary as the engine takes it.

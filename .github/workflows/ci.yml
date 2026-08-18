@@ -45,6 +45,6 @@ jobs:
       # the suite imports is what a person who runs `pip install zudb`
       # gets: the extension out of a wheel, the package out of
       # site-packages, and nothing resolved out of the checkout.
-      - run: pip install .
+      - run: pip install ".[all]"
       - run: pip install pytest
       - run: pytest
