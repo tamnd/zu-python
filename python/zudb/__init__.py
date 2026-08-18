@@ -15,6 +15,7 @@ nothing to run, and no server to connect to. Statements are ISO/IEC
 from __future__ import annotations
 
 from ._zudb import (
+    Appender,
     Connection,
     Duration,
     Node,
@@ -43,6 +44,7 @@ __all__ = [
     "connect",
     "load",
     "Connection",
+    "Appender",
     "Result",
     "Node",
     "Rel",

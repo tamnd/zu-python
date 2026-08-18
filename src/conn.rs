@@ -16,6 +16,7 @@ use pyo3::types::{PyCapsule, PyDict, PyList, PyTuple};
 use zudb::query::{QueryResult, Value};
 use zudb::{Config, Database};
 
+use crate::appender::Appender;
 use crate::columns;
 use crate::error::{closed, to_py_err};
 use crate::value::{Names, from_py, to_py};
@@ -35,7 +36,15 @@ const STREAM: &CStr = c"arrow_array_stream";
 pub struct Connection {
     /// `None` once closed, which is what makes a second `close()` do
     /// nothing and a statement after one an error rather than a crash.
-    inner: Mutex<Option<zudb::Connection>>,
+    ///
+    /// Reachable from the appender, which writes through the same
+    /// connection and takes this same lock. One rule holds for every
+    /// caller of it: take it with the GIL already released. A thread
+    /// that waited for it holding the GIL would stop every other
+    /// thread in the process for the length of somebody else's
+    /// statement, and would deadlock against the thread inside that
+    /// statement, which needs the GIL back to return.
+    pub(crate) inner: Mutex<Option<zudb::Connection>>,
     #[pyo3(get)]
     path: PathBuf,
     #[pyo3(get)]
@@ -96,6 +105,18 @@ impl Connection {
         params: Option<&Bound<'_, PyDict>>,
     ) -> PyResult<Result> {
         self.execute(py, statement, params)
+    }
+
+    /// Opens an appender on `table`, for loading rows into a database
+    /// that already exists.
+    ///
+    /// A statement writes one row at a time and commits each one, which
+    /// is the wrong shape for a million rows. An appender buffers them
+    /// in columns and writes each batch as one commit. The table has to
+    /// be there already, since an appender adds rows to a table and
+    /// does not make one.
+    fn appender(slf: Py<Self>, py: Python<'_>, table: &str) -> PyResult<Appender> {
+        Appender::open(py, slf, table)
     }
 
     /// Closes the connection and frees what it held.

@@ -120,20 +120,28 @@ fn severity(severity: zudb::Severity) -> &'static str {
     }
 }
 
-/// What a call raises when it is made on a connection that is closed.
+/// A mistake the program made, as the class for one.
 ///
-/// A `ValueError` would be wrong and a segfault would be worse: the
-/// caller made a mistake, in Python, and `zudb.ProgrammingError` is
-/// the class for a mistake a program made rather than a condition the
-/// engine raised.
-pub fn closed(py: Python<'_>, what: &str) -> PyErr {
+/// A `ValueError` would be wrong and a segfault would be worse:
+/// `zudb.ProgrammingError` is the class for something the caller did
+/// rather than for a condition the engine raised, and it is what a
+/// call made on an object that is closed, or handed something it
+/// cannot do anything with, raises.
+pub fn programming(py: Python<'_>, message: &str) -> PyErr {
     match errors(py).and_then(|errors| {
         let class: Bound<'_, PyType> = errors.getattr("ProgrammingError")?.cast_into()?;
-        Ok(PyErr::from_value(class.call1((format!(
-            "{what} is closed, so there is nothing left to run a statement on"
-        ),))?))
+        Ok(PyErr::from_value(class.call1((message,))?))
     }) {
         Ok(raised) => raised,
         Err(broken) => broken,
     }
+}
+
+/// What a statement raises when it is run on a connection that is
+/// closed.
+pub fn closed(py: Python<'_>, what: &str) -> PyErr {
+    programming(
+        py,
+        &format!("{what} is closed, so there is nothing left to run a statement on"),
+    )
 }

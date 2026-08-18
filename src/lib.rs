@@ -12,6 +12,8 @@
 //! that work. What it owes in return is the ABI's semantics, and the
 //! conformance corpus is what says whether it paid.
 
+mod appender;
+mod buffer;
 mod columns;
 mod conn;
 mod error;
@@ -51,6 +53,7 @@ fn _zudb(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_function(wrap_pyfunction!(load::load, module)?)?;
     module.add_class::<conn::Connection>()?;
     module.add_class::<conn::Result>()?;
+    module.add_class::<appender::Appender>()?;
     module.add_class::<value::Node>()?;
     module.add_class::<value::Rel>()?;
     module.add_class::<value::Path>()?;
