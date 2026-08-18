@@ -10,6 +10,10 @@
 The engine is compiled into the wheel, so there is nothing to install,
 nothing to run, and no server to connect to. Statements are ISO/IEC
 39075 GQL.
+
+On an event loop the same calls are awaited, from `zudb.aio`. It is a
+submodule to ask for by name rather than one imported here, so a script
+that never awaits anything pays for none of it.
 """
 
 from __future__ import annotations

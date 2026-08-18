@@ -140,6 +140,35 @@ conn.rows_read  # how far the statement running now has got
 
 `interrupt()` is the one a program calls, from a thread that is not the one inside `execute`, and it raises `zudb.Interrupted` there. It is one of the three calls that may be made on a connection while a statement is running, with `rows_read` and `closed`, and none of the three waits for it: a progress bar drawn from `rows_read` is a poll of an atomic, not a queue behind the executor.
 
+## On an event loop
+
+A statement runs inside Rust with the GIL down and comes back when it comes back. Called straight from a coroutine it stops the loop for that whole time, including the tasks answering requests that have nothing to do with the database, so `zudb.aio` gives each connection a thread of its own and hands it every call that could wait.
+
+```python
+import asyncio
+
+import zudb.aio
+
+
+async def main():
+    async with zudb.aio.connect("social.zu1") as conn:
+        await conn.execute("INSERT (p:person {uid: 1, name: 'ada'})")
+        rows = await conn.execute("MATCH (p:person) RETURN p.name AS name")
+        for (name,) in rows:
+            print(name)
+
+
+asyncio.run(main())
+```
+
+A thread per connection rather than a pool shared between them, because a connection is one lock and statements on it queue anyway: a pool would add no parallelism the engine can use and would let two statements written one after the other run in the other order. Two connections do run at the same time, since the engine puts the GIL down for the work, and two statements together cost 1.09 times what one costs alone on this machine.
+
+What comes back is a `zudb.Result`, which is rows already in memory, so reading them is the call it was: `for row in rows` and `rows.to_arrow()` are not awaited and never were. Only the ways in are, and only the ones that can wait. `path`, `read_only`, `closed`, `rows_read` and `interrupt()` are answered from beside the lock rather than through it, so they stay properties and a progress bar drawn from `rows_read` still reads while the statement it is measuring runs.
+
+Cancelling the task that awaits a statement interrupts the statement. The engine is asked to stop and the coroutine does not return until it has, so the connection is idle again by the time the `CancelledError` reaches the caller rather than busy with work nobody is waiting for, and a statement still queued when the cancellation arrives is dropped without running. A transaction block cancelled partway is a block that raised, so it leaves through the rollback.
+
+`transaction()` and `appender()` are opened with `async with`, `in_transaction()` and `registered()` are methods here because both answers live behind the lock, and everything else is the sync call with an `await` in front of it.
+
 ## When a program is wrong
 
 Every condition arrives as an exception class carrying its GQLSTATUS code, its position and a link to what the standard says about it, and the class is the class a Python caller would have written: a mistake the program made is a `zudb.ProgrammingError`, a value Python has and zu does not is a `TypeError`, a value of the right type and the wrong shape is a `ValueError`, and a file that is not a database is a `zudb.ConnectionError`, the same as a file that is not there. Both of those are a path that does not lead to a database, and telling a caller who mistyped one to file a bug would be the wrong answer twice.
@@ -154,7 +183,7 @@ The stub is checked against the module it describes in CI: griffe reads the stub
 
 ## What works today
 
-The list above is what this client is for. What it does so far is the core of it: `connect`, `execute` and `sql` with named parameters, results that iterate and fetch, values as Python objects both ways including dates, times, datetimes and durations, `Node`, `Rel` and `Path` as classes, `load` for building a graph with edges in it, an appender for growing one, transactions as a context manager that commits at the end of a block and rolls back when it raises, every condition as an exception class carrying its code, its position and its documentation link, results as Arrow columns and as pandas and polars frames, `register` for putting a frame under a name a statement can match on and reading it where it lies, stubs inside the wheel with a gate that keeps them true, the GIL released around every statement, every load and every copy out, and `Ctrl-C` and `interrupt()` stopping a statement without touching the connection under it. `zudb.aio` is next, and each one lands with the tests that say it works.
+The list above is what this client is for. What it does so far is the core of it: `connect`, `execute` and `sql` with named parameters, results that iterate and fetch, values as Python objects both ways including dates, times, datetimes and durations, `Node`, `Rel` and `Path` as classes, `load` for building a graph with edges in it, an appender for growing one, transactions as a context manager that commits at the end of a block and rolls back when it raises, every condition as an exception class carrying its code, its position and its documentation link, results as Arrow columns and as pandas and polars frames, `register` for putting a frame under a name a statement can match on and reading it where it lies, stubs inside the wheel with a gate that keeps them true, the GIL released around every statement, every load and every copy out, `Ctrl-C` and `interrupt()` stopping a statement without touching the connection under it, and `zudb.aio` for the same calls awaited on an event loop. A DB-API 2.0 wrapper is next, and each one lands with the tests that say it works.
 
 ## Wheels
 
