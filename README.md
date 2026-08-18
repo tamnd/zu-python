@@ -60,17 +60,23 @@ A result is rows to iterate and columns to hand to something else. The columns g
 
 ```python
 result = conn.execute("MATCH (p:person) RETURN p.name AS name, p.score AS score")
-result.to_arrow()      # pyarrow.Table
-result.to_pandas()     # DataFrame with Arrow-backed dtypes
-result.to_polars()     # polars.DataFrame
+result.to_arrow()  # pyarrow.Table
+result.to_pandas()  # DataFrame with Arrow-backed dtypes
+result.to_polars()  # polars.DataFrame
 result.record_batches()  # a reader, for a result larger than memory
 ```
 
 `Result` implements `__arrow_c_stream__`, so anything that reads the protocol reads a result directly and none of the four methods above is needed: `pyarrow.table(result)` and `polars.DataFrame(result)` both work. Batches are 65,536 rows. A column holds one type, which the values decide, and integers beside floats are the one mixture that widens rather than being refused. Nodes, rels and paths go across as structs. The copy runs with the GIL released, and on this machine 300,000 rows across three columns take 44 ms as Arrow against 67 ms as Python objects, and a single integer column takes 13.8 ms against 44.5 ms.
 
+## Types
+
+The wheel carries `py.typed` and a stub for the compiled module, so mypy, pyright and an editor's completion all work with nothing else installed. `zudb.Value` is the union a row holds and a parameter takes, for code that passes rows around and wants to say so.
+
+The stub is checked against the module it describes in CI: griffe reads the stub as text and the installed extension by inspection, and the two have to agree on every name, every parameter and every default. A stub is a promise no interpreter checks, so something has to.
+
 ## What works today
 
-The list above is what this client is for. What it does so far is the core of it: `connect`, `execute` and `sql` with named parameters, results that iterate and fetch, values as Python objects both ways including dates, times, datetimes and durations, `Node`, `Rel` and `Path` as classes, `load` for building a graph with edges in it, every condition as an exception class carrying its code, its position and its documentation link, results as Arrow columns and as pandas and polars frames, and the GIL released around every statement, every load and every copy out. `register`, the stubs and the interrupt are next, and each one lands with the tests that say it works.
+The list above is what this client is for. What it does so far is the core of it: `connect`, `execute` and `sql` with named parameters, results that iterate and fetch, values as Python objects both ways including dates, times, datetimes and durations, `Node`, `Rel` and `Path` as classes, `load` for building a graph with edges in it, every condition as an exception class carrying its code, its position and its documentation link, results as Arrow columns and as pandas and polars frames, stubs inside the wheel with a gate that keeps them true, and the GIL released around every statement, every load and every copy out. `register` and the interrupt are next, and each one lands with the tests that say it works.
 
 ## Wheels
 

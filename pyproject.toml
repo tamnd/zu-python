@@ -44,6 +44,9 @@ dev = [
   "maturin>=1.14,<2.0",
   "pytest>=8",
   "ruff>=0.9",
+  # Reads the stub as text and the built extension by inspection, which
+  # is what checks one against the other.
+  "griffe>=2",
   "pyarrow>=14",
   "pandas>=2.0",
   "polars>=1.3",
