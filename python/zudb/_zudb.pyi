@@ -69,10 +69,51 @@ class Connection:
     def sql(self, statement: str, params: Mapping[str, Value] | None = None) -> Result:
         """The same call, named for the way it reads in a notebook."""
 
+    def appender(self, table: str) -> Appender:
+        """Opens an appender on `table`, for loading rows into a database that already exists."""
+
     def close(self) -> None:
         """Closes the connection and frees what it held."""
 
     def __enter__(self) -> Connection: ...
+    def __exit__(self, *_exception: object) -> bool: ...
+    def __repr__(self) -> str: ...
+
+class Appender:
+    """Rows on their way into a table, buffered until they are flushed."""
+
+    @property
+    def table(self) -> str:
+        """The table this appender writes to."""
+
+    @property
+    def buffered(self) -> int:
+        """Rows buffered and not yet written."""
+
+    @property
+    def committed(self) -> int:
+        """Rows this appender has committed, across every flush."""
+
+    @property
+    def closed(self) -> bool:
+        """Whether this appender has been closed."""
+
+    def append_row(self, row: Iterable[Value]) -> None:
+        """Appends one row, which is a sequence of one value per column of the table."""
+
+    def append_rows(self, rows: Iterable[Iterable[Value]]) -> int:
+        """Appends every row of an iterable of rows."""
+
+    def flush(self) -> int:
+        """Writes every buffered row and makes it readable."""
+
+    def discard(self) -> int:
+        """Throws away what is buffered and answers how many rows that was."""
+
+    def close(self) -> int:
+        """Flushes what is left and answers how many rows this appender committed in all."""
+
+    def __enter__(self) -> Appender: ...
     def __exit__(self, *_exception: object) -> bool: ...
     def __repr__(self) -> str: ...
 

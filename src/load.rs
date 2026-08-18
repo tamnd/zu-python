@@ -17,49 +17,13 @@
 use std::path::PathBuf;
 
 use pyo3::prelude::*;
-use pyo3::types::{PyBool, PyDate, PyDateTime, PyDelta, PyDict, PyTime};
-use zu_common::DurationKind;
-use zu_common::temporal::days_from_civil;
+use pyo3::types::PyDict;
 use zudb::zu1::file::Zu1File;
 use zudb::zu1::graph::bulk_load_keyed;
 use zudb::zu1::props::{PropValues, store_props};
 
+use crate::buffer::{Column, Mismatch, type_name};
 use crate::error::to_py_err;
-use crate::value::{Duration, clock_nanos};
-
-/// One column, reduced to the vector the property store keeps it in.
-///
-/// Owned rather than borrowed from the caller's lists, because a
-/// Python list holds objects and the store holds numbers: there is
-/// nothing here to borrow. Which arm a column is comes from its first
-/// value, and every value after it has to be that arm too.
-enum Column {
-    Int(Vec<u64>),
-    Float(Vec<f64>),
-    Bool(Vec<bool>),
-    Str(Vec<Vec<u8>>),
-    Date(Vec<i32>),
-    LocalTime(Vec<i64>),
-    LocalDatetime(Vec<i64>),
-    Duration(DurationKind, Vec<i64>),
-}
-
-impl Column {
-    /// How many values are in it, which is how many rows the table has
-    /// if this is the first column and a refusal if it is not.
-    fn len(&self) -> usize {
-        match self {
-            Column::Int(v) => v.len(),
-            Column::Float(v) => v.len(),
-            Column::Bool(v) => v.len(),
-            Column::Str(v) => v.len(),
-            Column::Date(v) => v.len(),
-            Column::LocalTime(v) => v.len(),
-            Column::LocalDatetime(v) => v.len(),
-            Column::Duration(_, v) => v.len(),
-        }
-    }
-}
 
 /// Writes a new database at `path` and answers what went into it.
 ///
@@ -119,22 +83,24 @@ pub fn load(
         pairs.dedup();
         bulk_load_keyed(&mut db, nodes, rels, rows, &pairs, None)?;
         if !built.is_empty() {
-            // The store wants a slice of slices for a string column,
-            // which a `Vec<Vec<u8>>` is not, so the row borrows are
-            // built first and handed over after.
-            let strings: Vec<Vec<&[u8]>> = built
+            // The store wants a slice of slices for a column of strings
+            // or of bytes, which a vector of either is not, so the row
+            // borrows are built first and handed over after.
+            let runs: Vec<Vec<&[u8]>> = built
                 .iter()
                 .map(|(_, column)| match column {
-                    Column::Str(v) => v.iter().map(Vec::as_slice).collect(),
+                    Column::Str(v) => v.iter().map(String::as_bytes).collect(),
+                    Column::Bytes(v) => v.iter().map(Vec::as_slice).collect(),
                     _ => Vec::new(),
                 })
                 .collect();
             let props: Vec<(&str, PropValues<'_>)> = built
                 .iter()
-                .zip(&strings)
-                .map(|((name, column), strings)| {
+                .zip(&runs)
+                .map(|((name, column), runs)| {
                     let values = match column {
-                        Column::Str(_) => PropValues::Str(strings),
+                        Column::Str(_) => PropValues::Str(runs),
+                        Column::Bytes(_) => PropValues::Bytes(runs),
                         Column::Int(v) => PropValues::Int(v),
                         Column::Float(v) => PropValues::Float(v),
                         Column::Bool(v) => PropValues::Bool(v),
@@ -174,6 +140,16 @@ fn build(columns: Option<&Bound<'_, PyDict>>) -> PyResult<Vec<(String, Column)>>
             ));
         }
         let column = column(&name, &values)?;
+        // The store takes a column of bytes and every statement that
+        // reads one back refuses it, so a load that wrote one would be
+        // writing data the caller cannot get at again. Refused here
+        // until the read side catches up, at which point this goes and
+        // nothing else has to change.
+        if matches!(column, Column::Bytes(_)) {
+            return Err(pyo3::exceptions::PyTypeError::new_err(format!(
+                "column '{name}' holds byte strings, and no statement can read one back yet, so a load will not write a column of them"
+            )));
+        }
         if let Some((first, had)) = built.first().map(|(name, column)| (name, column.len()))
             && column.len() != had
         {
@@ -190,69 +166,29 @@ fn build(columns: Option<&Bound<'_, PyDict>>) -> PyResult<Vec<(String, Column)>>
 /// One column, read out of a sequence of Python objects.
 ///
 /// The first value settles what the column is and every value after it
-/// has to be the same thing. There is no null: a column that holds one
-/// cannot be loaded this way, so a null here could only be refused,
-/// and refusing it where it is named is better than refusing it at the
-/// end of a million rows.
+/// has to agree, which is [`Column`]'s rule and is the appender's rule
+/// too. What this adds is the column's name, because a message about a
+/// column is worth leading with the name of it.
 fn column(name: &str, values: &Bound<'_, PyAny>) -> PyResult<Column> {
     let mut column: Option<Column> = None;
     for (row, value) in values.try_iter()?.enumerate() {
         let value = value?;
-        let mismatch = |want: &str| {
-            let got = value
-                .get_type()
-                .getattr("__name__")
-                .and_then(|name| name.extract::<String>())
-                .unwrap_or_else(|_| "unknown".to_string());
-            pyo3::exceptions::PyTypeError::new_err(format!(
-                "column '{name}' holds {want} and row {row} is of type '{got}'"
-            ))
-        };
         match column.as_mut() {
-            None => column = Some(started(name, row, &value)?),
-            // Bool before int, since in Python every bool is an int
-            // and a column of `True` is not a column of ones.
-            Some(Column::Bool(v)) => v.push(
-                value
-                    .cast::<PyBool>()
-                    .map_err(|_| mismatch("booleans"))?
-                    .is_true(),
-            ),
-            Some(Column::Int(v)) => {
-                if value.cast::<PyBool>().is_ok() {
-                    return Err(mismatch("integers"));
-                }
-                v.push(value.extract::<i64>().map_err(|_| mismatch("integers"))? as u64);
+            Some(column) => column.widening_push(&value).map_err(|why| match why {
+                Mismatch::Wanted(holds) => pyo3::exceptions::PyTypeError::new_err(format!(
+                    "column '{name}' holds {holds} and row {row} is of type '{}'",
+                    type_name(&value)
+                )),
+                Mismatch::Python(err) => err,
+            })?,
+            None => {
+                column = Some(Column::start(&value)?.ok_or_else(|| {
+                    pyo3::exceptions::PyTypeError::new_err(format!(
+                        "column '{name}' starts at row {row} with a value of type '{}', and a loaded column holds booleans, integers, floats, strings, dates, times, datetimes or durations",
+                        type_name(&value)
+                    ))
+                })?);
             }
-            Some(Column::Float(v)) => {
-                v.push(value.extract::<f64>().map_err(|_| mismatch("floats"))?)
-            }
-            Some(Column::Str(v)) => v.push(
-                value
-                    .extract::<String>()
-                    .map_err(|_| mismatch("strings"))?
-                    .into_bytes(),
-            ),
-            // Datetime before date, since a datetime is a date and
-            // reading one as the other would throw the time away.
-            Some(Column::LocalDatetime(v)) => {
-                let dt = value
-                    .cast::<PyDateTime>()
-                    .map_err(|_| mismatch("datetimes"))?;
-                v.push(datetime_nanos(dt)?);
-            }
-            Some(Column::Date(v)) => {
-                if value.cast::<PyDateTime>().is_ok() {
-                    return Err(mismatch("dates"));
-                }
-                let date = value.cast::<PyDate>().map_err(|_| mismatch("dates"))?;
-                v.push(date_days(date)?);
-            }
-            Some(Column::LocalTime(v)) => {
-                let time = value.cast::<PyTime>().map_err(|_| mismatch("times"))?;
-                v.push(clock_nanos(time.as_any())?);
-            }
-            Some(Column::Duration(kind, v)) => v.push(duration_count(*kind, &value, mismatch)?),
         }
     }
     column.ok_or_else(|| {
@@ -260,98 +196,6 @@ fn column(name: &str, values: &Bound<'_, PyAny>) -> PyResult<Column> {
             "column '{name}' is empty, and an empty column says nothing about what it would hold"
         ))
     })
-}
-
-/// The column a first value starts, with that value already in it.
-fn started(name: &str, row: usize, value: &Bound<'_, PyAny>) -> PyResult<Column> {
-    if let Ok(b) = value.cast::<PyBool>() {
-        return Ok(Column::Bool(vec![b.is_true()]));
-    }
-    if let Ok(s) = value.extract::<String>() {
-        return Ok(Column::Str(vec![s.into_bytes()]));
-    }
-    if let Ok(n) = value.extract::<i64>() {
-        return Ok(Column::Int(vec![n as u64]));
-    }
-    if let Ok(f) = value.extract::<f64>() {
-        return Ok(Column::Float(vec![f]));
-    }
-    if let Ok(d) = value.extract::<Duration>() {
-        return Ok(if d.months == 0 {
-            Column::Duration(DurationKind::DayTime, vec![d.nanoseconds])
-        } else {
-            Column::Duration(DurationKind::YearMonth, vec![d.months])
-        });
-    }
-    if let Ok(delta) = value.cast::<PyDelta>() {
-        return Ok(Column::Duration(
-            DurationKind::DayTime,
-            vec![delta_nanos(delta)?],
-        ));
-    }
-    if let Ok(dt) = value.cast::<PyDateTime>() {
-        return Ok(Column::LocalDatetime(vec![datetime_nanos(dt)?]));
-    }
-    if let Ok(date) = value.cast::<PyDate>() {
-        return Ok(Column::Date(vec![date_days(date)?]));
-    }
-    if let Ok(time) = value.cast::<PyTime>() {
-        return Ok(Column::LocalTime(vec![clock_nanos(time.as_any())?]));
-    }
-    let got = value
-        .get_type()
-        .getattr("__name__")
-        .and_then(|name| name.extract::<String>())
-        .unwrap_or_else(|_| "unknown".to_string());
-    Err(pyo3::exceptions::PyTypeError::new_err(format!(
-        "column '{name}' starts at row {row} with a value of type '{got}', and a loaded column holds booleans, integers, floats, strings, dates, times, datetimes or durations"
-    )))
-}
-
-/// A duration for a column that is already one of the two kinds, which
-/// is the one place the two do not mix: a column of months has no room
-/// for a count of nanoseconds and the other way about.
-fn duration_count(
-    kind: DurationKind,
-    value: &Bound<'_, PyAny>,
-    mismatch: impl Fn(&str) -> PyErr,
-) -> PyResult<i64> {
-    let want = match kind {
-        DurationKind::YearMonth => "year-month durations",
-        DurationKind::DayTime => "day-time durations",
-    };
-    if let Ok(d) = value.extract::<Duration>() {
-        return match kind {
-            DurationKind::YearMonth if d.months != 0 || d.nanoseconds == 0 => Ok(d.months),
-            DurationKind::DayTime if d.months == 0 => Ok(d.nanoseconds),
-            _ => Err(mismatch(want)),
-        };
-    }
-    match (kind, value.cast::<PyDelta>()) {
-        (DurationKind::DayTime, Ok(delta)) => delta_nanos(delta),
-        _ => Err(mismatch(want)),
-    }
-}
-
-fn date_days(date: &Bound<'_, PyDate>) -> PyResult<i32> {
-    Ok(days_from_civil(
-        date.getattr("year")?.extract()?,
-        date.getattr("month")?.extract()?,
-        date.getattr("day")?.extract()?,
-    ))
-}
-
-fn datetime_nanos(dt: &Bound<'_, PyDateTime>) -> PyResult<i64> {
-    const NANOS_PER_DAY: i64 = 86_400 * 1_000_000_000;
-    let days = date_days(dt.as_any().cast::<PyDate>()?)?;
-    Ok(i64::from(days) * NANOS_PER_DAY + clock_nanos(dt.as_any())?)
-}
-
-fn delta_nanos(delta: &Bound<'_, PyDelta>) -> PyResult<i64> {
-    let days: i64 = delta.getattr("days")?.extract()?;
-    let seconds: i64 = delta.getattr("seconds")?.extract()?;
-    let micros: i64 = delta.getattr("microseconds")?.extract()?;
-    Ok(days * 86_400 * 1_000_000_000 + seconds * 1_000_000_000 + micros * 1_000)
 }
 
 /// The edge list, as the pairs of row numbers it is.
