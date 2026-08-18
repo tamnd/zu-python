@@ -17,8 +17,10 @@ mod buffer;
 mod columns;
 mod conn;
 mod error;
+mod frame;
 mod interrupt;
 mod load;
+mod register;
 mod txn;
 mod value;
 

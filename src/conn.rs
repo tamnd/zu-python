@@ -7,6 +7,7 @@
 //! to run statements at once want two connections. It is there so that
 //! a program which shares one by accident waits rather than corrupts.
 
+use std::collections::BTreeMap;
 use std::ffi::CStr;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -21,6 +22,7 @@ use crate::appender::Appender;
 use crate::columns;
 use crate::error::{closed, programming, to_py_err};
 use crate::interrupt;
+use crate::register;
 use crate::txn::Transaction;
 use crate::value::{Names, from_py, to_py};
 
@@ -66,6 +68,18 @@ pub struct Connection {
     /// asking it to stop, should not queue behind a ten second
     /// statement.
     alive: AtomicBool,
+    /// The names this connection has registered frames under, against
+    /// whether one is registered under them now. A name that was
+    /// unregistered stays here as `false`, because the empty table it
+    /// left behind is still a table this connection made and is still
+    /// the one a later `register` under the same name may fill: forget
+    /// it entirely and the name would be refused as somebody else's.
+    ///
+    /// Kept per connection rather than per database, because a
+    /// registered frame is a caller's data under a caller's name and
+    /// another program opening the same file has no idea it is anything
+    /// but a table.
+    frames: Mutex<BTreeMap<String, bool>>,
     #[pyo3(get)]
     path: PathBuf,
     #[pyo3(get)]
@@ -87,36 +101,7 @@ impl Connection {
         statement: &str,
         params: Option<&Bound<'_, PyDict>>,
     ) -> PyResult<Result> {
-        let params = bind(params)?;
-        // Owned rather than borrowed, both of them, because the thread
-        // that runs the statement is not this one and the borrow would
-        // have to say so. It is two allocations against a statement,
-        // which is nothing beside the parse it is about to have.
-        let statement = statement.to_string();
-        // The GIL goes down for the whole statement, waiting for the
-        // connection's own lock included. That is the point of a
-        // compiled engine in a Python process: another thread runs
-        // while this one is inside the executor. Where a `Ctrl-C` can
-        // arrive the statement goes on the connection's own thread and
-        // this one waits for it, which is the only way a press is felt
-        // before the statement ends.
-        let (result, names) =
-            interrupt::watched(py, &self.runner, &self.inner, &self.stop, move |conn| {
-                let borrowed: Vec<(&str, Value)> = params
-                    .iter()
-                    .map(|(name, value)| (name.as_str(), value.clone()))
-                    .collect();
-                let names = Names::of(conn.session_mut().catalog());
-                conn.query_with(&statement, &borrowed)
-                    .map(|result| (result, names))
-            })
-            .map_err(|stopped| stopped.raise(py))?
-            .map_err(|err| to_py_err(py, err))?;
-        Ok(Result {
-            result,
-            names,
-            next: Mutex::new(0),
-        })
+        self.query(py, statement, bind(params)?)
     }
 
     /// The same call, named for the way it reads in a notebook:
@@ -164,7 +149,7 @@ impl Connection {
     /// statement, since the answer belongs to the session and the
     /// session is what the statement is holding.
     #[getter]
-    fn in_transaction(&self, py: Python<'_>) -> PyResult<bool> {
+    pub(crate) fn in_transaction(&self, py: Python<'_>) -> PyResult<bool> {
         if !self.alive.load(Ordering::Acquire) {
             return Err(closed(py, "this connection"));
         }
@@ -200,6 +185,59 @@ impl Connection {
             ));
         }
         Appender::open(py, slf, table)
+    }
+
+    /// Puts a DataFrame under a name a statement can match on.
+    ///
+    /// ```python
+    /// conn.register("people", frame)
+    /// conn.execute("MATCH (p:people) WHERE p.age > 40 RETURN p.name AS name")
+    /// ```
+    ///
+    /// Anything that speaks Arrow goes in: a pandas or polars
+    /// DataFrame, a pyarrow Table or RecordBatchReader, or a dictionary
+    /// of lists. The frame is copied into the database rather than
+    /// scanned where it sits, because the engine has no way yet to call
+    /// back out to a Python object mid statement, so what a program
+    /// registers is a snapshot: changing the DataFrame afterwards
+    /// changes nothing here until it is registered again.
+    ///
+    /// Registering the same name again replaces the rows under it.
+    /// Registering over a table this connection did not register is
+    /// refused, since a frame knows nothing about the rows that were
+    /// already there. Gives back the number of rows written.
+    fn register(
+        slf: Py<Self>,
+        py: Python<'_>,
+        name: &str,
+        data: &Bound<'_, PyAny>,
+    ) -> PyResult<usize> {
+        register::register(py, slf, name, data)
+    }
+
+    /// Takes the rows of a registered frame back out.
+    ///
+    /// The name stops being a frame of this connection's and the rows
+    /// go. The empty table stays in the catalog, because no statement
+    /// of this engine drops one yet, so the name cannot afterwards be
+    /// used for something that is not a table.
+    fn unregister(&self, py: Python<'_>, name: &str) -> PyResult<()> {
+        register::unregister(py, self, name)
+    }
+
+    /// The names this connection has registered frames under, sorted.
+    #[getter]
+    fn registered(&self) -> Vec<String> {
+        self.frames
+            .lock()
+            .map(|frames| {
+                frames
+                    .iter()
+                    .filter(|&(_, &registered)| registered)
+                    .map(|(name, _)| name.clone())
+                    .collect()
+            })
+            .unwrap_or_default()
     }
 
     /// Asks the statement running on this connection to stop.
@@ -323,20 +361,121 @@ impl Connection {
             inner: Arc::new(Mutex::new(Some(opened))),
             runner: OnceLock::new(),
             alive: AtomicBool::new(true),
+            frames: Mutex::new(BTreeMap::new()),
             path,
             read_only,
+        })
+    }
+
+    /// Runs one statement, with its parameters already engine values.
+    ///
+    /// The one path every statement takes, whether the parameters came
+    /// from a caller's dictionary or were built here.
+    pub(crate) fn query(
+        &self,
+        py: Python<'_>,
+        statement: &str,
+        params: Vec<(String, Value)>,
+    ) -> PyResult<Result> {
+        // Owned rather than borrowed, because the thread that runs the
+        // statement is not this one and the borrow would have to say
+        // so. It is one allocation against a statement, which is
+        // nothing beside the parse it is about to have.
+        let statement = statement.to_string();
+        // The GIL goes down for the whole statement, waiting for the
+        // connection's own lock included. That is the point of a
+        // compiled engine in a Python process: another thread runs
+        // while this one is inside the executor. Where a `Ctrl-C` can
+        // arrive the statement goes on the connection's own thread and
+        // this one waits for it, which is the only way a press is felt
+        // before the statement ends.
+        let (result, names) =
+            interrupt::watched(py, &self.runner, &self.inner, &self.stop, move |conn| {
+                let borrowed: Vec<(&str, Value)> = params
+                    .iter()
+                    .map(|(name, value)| (name.as_str(), value.clone()))
+                    .collect();
+                let names = Names::of(conn.session_mut().catalog());
+                conn.query_with(&statement, &borrowed)
+                    .map(|result| (result, names))
+            })
+            .map_err(|stopped| stopped.raise(py))?
+            .map_err(|err| to_py_err(py, err))?;
+        Ok(Result {
+            result,
+            names,
+            next: Mutex::new(0),
         })
     }
 
     /// Runs a statement that takes no parameters and gives back
     /// nothing, which is what the three transaction words are.
     ///
-    /// It goes through `execute` rather than around it, so a `COMMIT`
-    /// waits for the connection's lock, releases the GIL and feels a
-    /// `Ctrl-C` exactly as every other statement does. The result is
-    /// dropped, since the words return no columns.
+    /// It goes through the same path as every other statement, so a
+    /// `COMMIT` waits for the connection's lock, releases the GIL and
+    /// feels a `Ctrl-C` exactly as they do. The result is dropped,
+    /// since the words return no columns.
     pub(crate) fn run(&self, py: Python<'_>, statement: &str) -> PyResult<()> {
-        self.execute(py, statement, None).map(|_| ())
+        self.query(py, statement, Vec::new()).map(|_| ())
+    }
+
+    /// Work done on the engine connection itself, with the GIL down.
+    ///
+    /// For the things a statement cannot say: reading the catalog,
+    /// opening the engine's own appender. The two failures are kept
+    /// apart because they belong to different people. A connection that
+    /// is closed or locked is this call's own answer and comes back as
+    /// the outer error; anything the work itself decides is wrong comes
+    /// back as the inner one, for the caller to turn into an exception
+    /// now that there is an interpreter to build one with.
+    pub(crate) fn engine<T, S, F>(
+        &self,
+        py: Python<'_>,
+        work: F,
+    ) -> PyResult<std::result::Result<T, S>>
+    where
+        T: Send,
+        S: Send,
+        F: FnOnce(&mut zudb::Connection) -> std::result::Result<T, S> + Send,
+    {
+        if !self.alive.load(Ordering::Acquire) {
+            return Err(closed(py, "this connection"));
+        }
+        py.detach(|| {
+            let mut held = self.inner.lock().map_err(|_| ())?;
+            let conn = held.as_mut().ok_or(())?;
+            Ok(work(conn))
+        })
+        .map_err(|()| closed(py, "this connection"))
+    }
+
+    /// Whether a frame is registered here under this name right now.
+    pub(crate) fn registered_here(&self, name: &str) -> bool {
+        self.frames
+            .lock()
+            .is_ok_and(|frames| frames.get(name) == Some(&true))
+    }
+
+    /// Whether this connection made the table of this name, whether or
+    /// not a frame is registered under it now.
+    pub(crate) fn made_here(&self, name: &str) -> bool {
+        self.frames
+            .lock()
+            .is_ok_and(|frames| frames.contains_key(name))
+    }
+
+    pub(crate) fn remember(&self, name: &str) {
+        if let Ok(mut frames) = self.frames.lock() {
+            frames.insert(name.to_string(), true);
+        }
+    }
+
+    pub(crate) fn forget(&self, name: &str) {
+        if let Ok(mut frames) = self.frames.lock()
+            && let Some(registered) = frames.get_mut(name)
+        {
+            *registered = false;
+        }
     }
 }
 
