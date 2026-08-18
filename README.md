@@ -9,15 +9,15 @@ with zudb.connect("social.zu1") as conn:
     conn.execute("INSERT (p:person {uid: 1, name: 'ada'})")
     conn.execute("INSERT (p:person {uid: $uid, name: $name})", {"uid": 2, "name": "grace"})
 
-    for name, uid in conn.execute("MATCH (p:person) RETURN p.name AS name, p.uid AS uid"):
-        print(name, uid)
+    people = conn.execute("MATCH (p:person) RETURN p.name AS name, p.uid AS uid")
+    print(people.to_pandas())
 ```
 
 ```
-pip install zudb
+pip install "zudb[pandas]"
 ```
 
-No compiler, no `pkg-config`, no postinstall script. One wheel per platform with the engine inside it.
+No compiler, no `pkg-config`, no postinstall script. One wheel per platform with the engine inside it. `pip install zudb` on its own brings nothing else at all; the extra above is pandas, which the last line of the snippet asks for and which a result hands its columns to over Arrow. A test in this repository runs that snippet exactly as it is printed, in a directory of its own, because a quickstart is the most read and least compiled code a project has.
 
 ## What this is
 
@@ -38,6 +38,8 @@ The interesting parts:
 A statement writes one row at a time, which is the wrong shape for loading data and cannot make a rel table at all. `load` is the other shape: a table's columns whole, the edges between them whole, one file written once.
 
 ```python
+import zudb
+
 zudb.load(
     "social.zu1",
     nodes="person",
