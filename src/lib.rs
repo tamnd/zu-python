@@ -18,6 +18,7 @@ mod columns;
 mod conn;
 mod error;
 mod frame;
+mod html;
 mod interrupt;
 mod load;
 mod register;

@@ -59,7 +59,7 @@ jobs:
       # griffe reads the stub and inspects the installed extension, so
       # the check runs against the wheel rather than against the
       # checkout it was built from.
-      - run: pip install pytest griffe
+      - run: pip install pytest griffe ipython
       - run: pytest
 
   # The shared corpus, which is the same 945 cases the engine runs

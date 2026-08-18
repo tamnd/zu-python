@@ -47,6 +47,11 @@ dev = [
   # Reads the stub as text and the built extension by inspection, which
   # is what checks one against the other.
   "griffe>=2",
+  # For `%gql` and `%%gql`, which are tested against a real shell
+  # rather than against a stub of one. Not a dependency of the wheel:
+  # anyone with a notebook has IPython already, and nobody else needs
+  # it.
+  "ipython>=8",
   "pyarrow>=14",
   "pandas>=2.0",
   "polars>=1.3",

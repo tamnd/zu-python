@@ -16,6 +16,8 @@ use zu_common::{DurationKind, Temporal};
 use zudb::query::Value;
 use zudb::zu1::catalog::Catalog;
 
+use crate::html;
+
 /// Microseconds in a day, which is the unit `datetime.timedelta`
 /// normalizes to and the one this has to split a duration across.
 const MICROS_PER_DAY: i64 = 86_400 * 1_000_000;
@@ -103,6 +105,12 @@ impl Node {
     fn __repr__(&self) -> String {
         format!("Node({}, {})", self.table, self.offset)
     }
+
+    /// The node as a notebook draws it, which is the pair that names
+    /// it: the table it is in and the row it sits at.
+    fn _repr_html_(&self) -> String {
+        html::wrap(&html::node(self))
+    }
 }
 
 /// One edge of the graph.
@@ -139,6 +147,13 @@ impl Rel {
 
     fn __repr__(&self) -> String {
         format!("Rel({}, {} -> {})", self.table, self.src, self.dst)
+    }
+
+    /// The edge as a notebook draws it, with the rows it joins on
+    /// either side of the arrow, since nothing beside it says which
+    /// they are.
+    fn _repr_html_(&self) -> String {
+        html::wrap(&html::rel(self))
     }
 }
 
@@ -178,6 +193,12 @@ impl Path {
 
     fn __repr__(&self, py: Python<'_>) -> String {
         format!("Path({} hops)", self.__len__(py))
+    }
+
+    /// The walk as a notebook draws it, nodes and arrows alternating
+    /// the way a statement writes one.
+    fn _repr_html_(&self, py: Python<'_>) -> PyResult<String> {
+        Ok(html::wrap(&html::path(py, self)?))
     }
 }
 
