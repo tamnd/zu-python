@@ -71,6 +71,8 @@ A row is every column of the table, in the order the table declares them, and th
 
 The `with` block closes, and closing flushes, including on the way out of a block that raised: a load that stopped partway is better served by its rows arriving than by them vanishing, and `discard()` is there for the caller who wants the other answer. A flush that fails keeps its rows, so what did not go in is still there to look at.
 
+An appender nobody closed is the one mistake that cannot be reported where it happens, and it raises a `ResourceWarning` naming the table and the rows when the collector takes it. Flushing from there is the other answer and is not available, because a collector runs whenever it likes, including while another thread is inside a statement on the same connection. The warning is the whole point: a loop that appended a million rows and never closed leaves a database with nothing in it, and going quietly about that is worse than a line on stderr.
+
 On this machine 200,000 rows of an integer and a string take 11 ms to buffer through `append_rows` and 93 ms to flush, which is 1.9 million rows a second including the commit. The same rows one call at a time cost 32 ms of buffering, since a call is a call. Against `INSERT`, 2,000 rows take 32 seconds a row at a time and 28 ms through an appender, and the gap widens with the table because every `INSERT` is a commit and a fold.
 
 ## Reading a result as columns
@@ -100,6 +102,12 @@ conn.rows_read  # how far the statement running now has got
 `Ctrl-C` is the one a person presses, and it raises `KeyboardInterrupt` on the thread that called `execute`, measured at 5 ms from the press on this machine against a budget of 50. Python only delivers a signal to the main thread between two bytecodes, so a statement called from the main thread runs on a thread this client keeps for it and the main thread waits and asks for signals while it does. That thread is kept rather than made per statement, because making one costs 30 microseconds against a small statement that costs 10, and a statement called from any other thread runs inline where a signal was never going to arrive anyway.
 
 `interrupt()` is the one a program calls, from a thread that is not the one inside `execute`, and it raises `zudb.Interrupted` there. It is one of the three calls that may be made on a connection while a statement is running, with `rows_read` and `closed`, and none of the three waits for it: a progress bar drawn from `rows_read` is a poll of an atomic, not a queue behind the executor.
+
+## When a program is wrong
+
+Every condition arrives as an exception class carrying its GQLSTATUS code, its position and a link to what the standard says about it, and the class is the class a Python caller would have written: a mistake the program made is a `zudb.ProgrammingError`, a value Python has and zu does not is a `TypeError`, a value of the right type and the wrong shape is a `ValueError`, and a file that is not a database is a `zudb.ConnectionError`, the same as a file that is not there. Both of those are a path that does not lead to a database, and telling a caller who mistyped one to file a bug would be the wrong answer twice.
+
+`tests/test_misuse.py` is twenty-three deliberately wrong programs and what each of them is told, run against the same list the engine runs in `crates/zu/tests/misuse.rs`. A message has to name the thing the caller named, say what was expected instead, and be the engine's own sentence rather than a syscall's, because "failed to fill whole buffer" is a true statement about a read that tells nobody which file was not a database. The suite checks the other two words too: nothing crashes, and nothing leaks, which is five hundred failing connects followed by a database that still opens and no connection left alive behind the collector's back. Half of it is the programs that look wrong and are not, since a parameter nothing reads, a label nothing carries and a second `close()` are all decisions somebody would otherwise reverse by accident.
 
 ## Types
 

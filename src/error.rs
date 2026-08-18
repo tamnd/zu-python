@@ -95,6 +95,13 @@ fn class_for(err: &ZuError) -> &'static str {
             // missing path as an internal error would tell the caller
             // to file a bug about their own typo.
             ZuError::Io(_) => "ConnectionError",
+            // And so is a file that is there and is not a database,
+            // which is the same typo landing on a real file. Every
+            // corruption a client can meet is a file it opened, so
+            // this is the connection failing rather than the engine,
+            // and the message says which file and what was wrong with
+            // it.
+            ZuError::Corrupt { .. } => "ConnectionError",
             _ => "InternalError",
         };
     };

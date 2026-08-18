@@ -337,6 +337,17 @@ fn kind_of(name: &str, row: usize, value: &Value) -> Result<Kind, Snag> {
                 )));
             }
         },
+        // GV60 and GV61. A handle is a reference, and a column of
+        // references is a column of nothing a frame can hold: the
+        // graph is in the file and the binding table is behind the
+        // handle. A caller who wants one in a frame reads the rows,
+        // where it arrives as the string that names it, or projects
+        // the columns of the table instead of the table.
+        Value::Graph(_) | Value::BindingTable(_) => {
+            return Err(Snag::Type(format!(
+                "row {row} of column '{name}' is a reference to a graph or a binding table, which Arrow has no type for"
+            )));
+        }
         // Never in a result: the executor settles a chain into its
         // edges before the rows leave the pipeline.
         Value::Chain(_) => {

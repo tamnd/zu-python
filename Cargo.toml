@@ -18,8 +18,8 @@ crate-type = ["cdylib"]
 # with (ADR 0002), so a revision is the honest way to say which one.
 # A local checkout is used instead with a `paths` override in
 # `.cargo/config.toml`, which is untracked on purpose.
-zudb = { package = "zu", git = "https://github.com/tamnd/zu", rev = "6ceb6d50abe20cfbef97c3d0d033d051c0649521" }
-zu-common = { git = "https://github.com/tamnd/zu", rev = "6ceb6d50abe20cfbef97c3d0d033d051c0649521" }
+zudb = { package = "zu", git = "https://github.com/tamnd/zu", rev = "8009a961f463d6b576509e0f752b60f44071cd33" }
+zu-common = { git = "https://github.com/tamnd/zu", rev = "8009a961f463d6b576509e0f752b60f44071cd33" }
 # `extension-module` is asked for by maturin, in pyproject.toml, and
 # not here. Only the build backend knows how an extension is linked on
 # the platform it is building for, and a crate that turns the feature
