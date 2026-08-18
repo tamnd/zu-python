@@ -19,6 +19,7 @@ mod conn;
 mod error;
 mod interrupt;
 mod load;
+mod txn;
 mod value;
 
 use std::path::PathBuf;
@@ -55,6 +56,7 @@ fn _zudb(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_class::<conn::Connection>()?;
     module.add_class::<conn::Result>()?;
     module.add_class::<appender::Appender>()?;
+    module.add_class::<txn::Transaction>()?;
     module.add_class::<value::Node>()?;
     module.add_class::<value::Rel>()?;
     module.add_class::<value::Path>()?;
