@@ -38,10 +38,19 @@ def test_an_excerpt_and_a_caret_point_at_the_token(empty: zudb.Connection) -> No
     assert pointer.index("^") == err.column - 1
 
 
-def test_a_label_nothing_declares_is_a_reference_error(empty: zudb.Connection) -> None:
+def test_a_name_nothing_bound_is_a_reference_error(empty: zudb.Connection) -> None:
     with pytest.raises(zudb.Error) as raised:
-        empty.execute("MATCH (p:person)-[:follows]->(q:person) RETURN p")
+        empty.execute("RETURN nobody AS x")
     assert raised.value.code == "42002"
+
+
+def test_a_pattern_the_graph_cannot_satisfy_matches_nothing(empty: zudb.Connection) -> None:
+    """A label nothing declares is not an error, it is a pattern with no
+    answer, which is the reading a client that composes a query out of
+    optional parts depends on."""
+    result = empty.execute("MATCH (p:person)-[:follows]->(q:person) RETURN p")
+    assert result.columns == ["p"]
+    assert result.fetchall() == []
 
 
 def test_every_condition_is_catchable_as_the_base_class(empty: zudb.Connection) -> None:

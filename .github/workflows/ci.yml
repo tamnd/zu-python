@@ -61,3 +61,38 @@ jobs:
       # checkout it was built from.
       - run: pip install pytest griffe
       - run: pytest
+
+  # The shared corpus, which is the same 945 cases the engine runs
+  # against itself and the eight other clients run against theirs. It is
+  # a job of its own because it needs a second checkout, and it runs on
+  # one platform because what it is asking about is this client's value
+  # mapping rather than anything the operating system decides.
+  corpus:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.14"
+      - uses: Swatinem/rust-cache@v2
+      # The cases are versioned with the engine, so the revision comes
+      # out of the pin this client already builds against rather than
+      # being written down a second time and drifting.
+      - id: pin
+        run: |
+          rev=$(sed -n 's/^zudb = .*rev = "\([0-9a-f]*\)".*/\1/p' Cargo.toml)
+          test -n "$rev"
+          echo "rev=$rev" >> "$GITHUB_OUTPUT"
+      - uses: actions/checkout@v7
+        with:
+          repository: tamnd/zu
+          ref: ${{ steps.pin.outputs.rev }}
+          path: engine
+      - run: pip install . pytest
+      # The runner first, because its summary is the line a person
+      # reads, and the suite second, because it is the one that knows
+      # which cases this client is allowed to leave unanswered.
+      - run: python -m conformance engine/conformance/cases
+      - run: pytest tests/test_conformance.py
+        env:
+          ZU_CASES: engine/conformance/cases
