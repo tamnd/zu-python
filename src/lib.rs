@@ -12,6 +12,7 @@
 //! that work. What it owes in return is the ABI's semantics, and the
 //! conformance corpus is what says whether it paid.
 
+mod columns;
 mod conn;
 mod error;
 mod load;

@@ -53,18 +53,28 @@ impl Names {
     /// The table's name, or its id written out for a table the catalog
     /// no longer has. A result outlives nothing here, but a name is
     /// for reading and an unreadable one should still print.
-    fn node(&self, id: u32) -> String {
-        self.nodes
-            .get(&id)
-            .cloned()
+    pub fn node(&self, id: u32) -> String {
+        self.node_name(id)
+            .map(str::to_owned)
             .unwrap_or_else(|| format!("#{id}"))
     }
 
-    fn rel(&self, id: u32) -> String {
-        self.rels
-            .get(&id)
-            .cloned()
+    pub fn rel(&self, id: u32) -> String {
+        self.rel_name(id)
+            .map(str::to_owned)
             .unwrap_or_else(|| format!("#{id}"))
+    }
+
+    /// The same names, borrowed. A column of a hundred million nodes
+    /// holds a handful of distinct table names, and copying one of them
+    /// per row is the difference between building a string column and
+    /// allocating one.
+    pub fn node_name(&self, id: u32) -> Option<&str> {
+        self.nodes.get(&id).map(String::as_str)
+    }
+
+    pub fn rel_name(&self, id: u32) -> Option<&str> {
+        self.rels.get(&id).map(String::as_str)
     }
 }
 

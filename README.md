@@ -46,15 +46,31 @@ zudb.load(
 )
 
 with zudb.connect("social.zu1", read_only=True) as conn:
-    for a, b in conn.execute("MATCH (a:person)-[:knows]->(b:person) RETURN a.name AS a, b.name AS b"):
+    for a, b in conn.execute(
+        "MATCH (a:person)-[:knows]->(b:person) RETURN a.name AS a, b.name AS b"
+    ):
         print(a, "knows", b)
 ```
 
 Edges name rows by position, counting from zero, because at load time a row has no other name. Columns may hold booleans, integers, floats, strings, dates, times, datetimes or durations, one kind to a column, and the GIL is released for the write.
 
+## Reading a result as columns
+
+A result is rows to iterate and columns to hand to something else. The columns go out over the Arrow C Data Interface, so pyarrow, pandas and polars each read the same buffers and none of them gets a Python object per cell.
+
+```python
+result = conn.execute("MATCH (p:person) RETURN p.name AS name, p.score AS score")
+result.to_arrow()      # pyarrow.Table
+result.to_pandas()     # DataFrame with Arrow-backed dtypes
+result.to_polars()     # polars.DataFrame
+result.record_batches()  # a reader, for a result larger than memory
+```
+
+`Result` implements `__arrow_c_stream__`, so anything that reads the protocol reads a result directly and none of the four methods above is needed: `pyarrow.table(result)` and `polars.DataFrame(result)` both work. Batches are 65,536 rows. A column holds one type, which the values decide, and integers beside floats are the one mixture that widens rather than being refused. Nodes, rels and paths go across as structs. The copy runs with the GIL released, and on this machine 300,000 rows across three columns take 44 ms as Arrow against 67 ms as Python objects, and a single integer column takes 13.8 ms against 44.5 ms.
+
 ## What works today
 
-The list above is what this client is for. What it does so far is the core of it: `connect`, `execute` and `sql` with named parameters, results that iterate and fetch, values as Python objects both ways including dates, times, datetimes and durations, `Node`, `Rel` and `Path` as classes, `load` for building a graph with edges in it, every condition as an exception class carrying its code, its position and its documentation link, and the GIL released around every statement and every load. Arrow, `register`, the stubs and the interrupt are next, and each one lands with the tests that say it works.
+The list above is what this client is for. What it does so far is the core of it: `connect`, `execute` and `sql` with named parameters, results that iterate and fetch, values as Python objects both ways including dates, times, datetimes and durations, `Node`, `Rel` and `Path` as classes, `load` for building a graph with edges in it, every condition as an exception class carrying its code, its position and its documentation link, results as Arrow columns and as pandas and polars frames, and the GIL released around every statement, every load and every copy out. `register`, the stubs and the interrupt are next, and each one lands with the tests that say it works.
 
 ## Wheels
 

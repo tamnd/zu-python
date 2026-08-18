@@ -25,6 +25,11 @@ zu-common = { git = "https://github.com/tamnd/zu", rev = "67afd055032932eec36f4e
 # the platform it is building for, and a crate that turns the feature
 # on by default is a crate `cargo build` cannot link on its own.
 pyo3 = { version = "0.29", features = ["abi3-py311"] }
+# Arrow, for the columns a result leaves as. Only `ffi` is asked for:
+# the readers and writers are the engine's business and what is wanted
+# here is the C Data Interface, which is how a result reaches pyarrow,
+# pandas and polars without a Python object per cell.
+arrow = { version = "59", default-features = false, features = ["ffi"] }
 
 [profile.release]
 lto = "thin"
