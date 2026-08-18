@@ -127,7 +127,7 @@ pub fn load(
 
 /// Every column, in the order the dictionary holds them, which is the
 /// order they were written.
-fn build(columns: Option<&Bound<'_, PyDict>>) -> PyResult<Vec<(String, Column)>> {
+pub(crate) fn build(columns: Option<&Bound<'_, PyDict>>) -> PyResult<Vec<(String, Column)>> {
     let Some(columns) = columns else {
         return Ok(Vec::new());
     };

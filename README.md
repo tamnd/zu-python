@@ -93,6 +93,23 @@ An appender is refused inside a transaction. Its batches are commits of their ow
 
 The wrapper costs 5 microseconds for an empty transaction, so what it costs is what the engine charges. On this machine that is more rather than less: 200 `INSERT`s cost 2.2 seconds each committing on its own and 3.3 seconds inside one transaction, and reads cost the same either way. A transaction here is worth taking for the span it holds and not for the time it saves, and the v0 write path is where that number has to change.
 
+## Bringing a DataFrame in
+
+A frame a program already has becomes something a statement can match on, under a name the program picks.
+
+```python
+conn.register("people", frame)
+conn.execute("MATCH (p:people) WHERE p.age > 40 RETURN p.name AS name")
+```
+
+Anything that speaks Arrow goes in, which is a pandas or polars DataFrame, a pyarrow table or a reader over one, and a dictionary of lists is there for a caller with none of them installed. The frame arrives over the same C Data Interface a result leaves by, so a column costs a memcpy and no Python object per cell: a million rows of one integer column are read in 5 ms, and a million rows of an integer, a float and a string take 138 ms, which is the string column being the only one that allocates.
+
+What this is not is a scan of the frame where it sits. DuckDB's `register` is zero copy because its executor can call back out to the Python object holding the data, and this engine has no such callback yet, so the frame is copied in and becomes a table like any other. That makes a registered frame a snapshot: changing the DataFrame afterwards changes nothing until it is registered again. The call is the one it would be either way, and the day the engine grows a scan it becomes the cheap thing under the same name.
+
+The copy is not the slow kind, but the write is a write. Those million rows take 9.3 seconds in all, of which 0.14 is reading the frame and the rest is the engine, which is the same 0.1 to 0.2 million rows a second `load` and the appender manage on this machine. Registering is the right way to get a frame in and it is not a way to make the v0 write path faster.
+
+`unregister(name)` takes the rows back out and `conn.registered` says what is registered here. Registering the same name again replaces the rows under it, which is what rerunning a cell means by it, and registering over a table this connection did not register is refused, since a frame knows nothing about the rows that were already there. Two things show the engine through and are said rather than worked around: a name that has been used keeps the columns it was used with, because a table's columns are declared by its first row and no statement alters them, and `unregister` empties the table rather than removing it, because no statement drops one. A null anywhere is refused by column and row, since a property that is null is one no row of this engine holds, and registering inside a transaction is refused for the reason an appender is.
+
 ## Reading a result as columns
 
 A result is rows to iterate and columns to hand to something else. The columns go out over the Arrow C Data Interface, so pyarrow, pandas and polars each read the same buffers and none of them gets a Python object per cell.
@@ -135,7 +152,7 @@ The stub is checked against the module it describes in CI: griffe reads the stub
 
 ## What works today
 
-The list above is what this client is for. What it does so far is the core of it: `connect`, `execute` and `sql` with named parameters, results that iterate and fetch, values as Python objects both ways including dates, times, datetimes and durations, `Node`, `Rel` and `Path` as classes, `load` for building a graph with edges in it, an appender for growing one, transactions as a context manager that commits at the end of a block and rolls back when it raises, every condition as an exception class carrying its code, its position and its documentation link, results as Arrow columns and as pandas and polars frames, stubs inside the wheel with a gate that keeps them true, the GIL released around every statement, every load and every copy out, and `Ctrl-C` and `interrupt()` stopping a statement without touching the connection under it. `register` is next, and each one lands with the tests that say it works.
+The list above is what this client is for. What it does so far is the core of it: `connect`, `execute` and `sql` with named parameters, results that iterate and fetch, values as Python objects both ways including dates, times, datetimes and durations, `Node`, `Rel` and `Path` as classes, `load` for building a graph with edges in it, an appender for growing one, transactions as a context manager that commits at the end of a block and rolls back when it raises, every condition as an exception class carrying its code, its position and its documentation link, results as Arrow columns and as pandas and polars frames, `register` for putting a frame under a name a statement can match on, stubs inside the wheel with a gate that keeps them true, the GIL released around every statement, every load and every copy out, and `Ctrl-C` and `interrupt()` stopping a statement without touching the connection under it. `zudb.aio` is next, and each one lands with the tests that say it works.
 
 ## Wheels
 

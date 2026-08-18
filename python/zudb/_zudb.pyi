@@ -86,6 +86,16 @@ class Connection:
     def appender(self, table: str) -> Appender:
         """Opens an appender on `table`, for loading rows into a database that already exists."""
 
+    def register(self, name: str, data: Any) -> int:
+        """Puts a DataFrame under a name a statement can match on."""
+
+    def unregister(self, name: str) -> None:
+        """Takes the rows of a registered frame back out."""
+
+    @property
+    def registered(self) -> list[str]:
+        """The names this connection has registered frames under, sorted."""
+
     def close(self) -> None:
         """Closes the connection and frees what it held."""
 
