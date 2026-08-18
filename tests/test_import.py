@@ -111,6 +111,17 @@ def test_no_dataframe_library_is_imported_by_importing_this_one() -> None:
     assert done.stdout.strip() == "", f"imported without being asked: {done.stdout.strip()}"
 
 
+def test_the_event_loop_module_is_not_imported_by_importing_this_one() -> None:
+    """`zudb.aio` is a submodule a caller asks for by name.
+
+    It pulls in asyncio and a thread pool, and a script that never
+    awaits anything should not pay for either, so it is left out of the
+    package's own imports.
+    """
+    done = run("import sys, zudb; print('asyncio' in sys.modules, 'zudb.aio' in sys.modules)")
+    assert done.stdout.strip() == "False False"
+
+
 def test_pyarrow_arrives_when_a_result_is_asked_for_its_columns(tmp_path: Path) -> None:
     pytest.importorskip("pyarrow")
     path = tmp_path / "columns.zu1"

@@ -6,12 +6,12 @@ a renamed keyword at a time, until somebody's first five minutes are
 spent on a traceback. So the blocks that are whole programs are run
 here, as printed, character for character.
 
-A block is a whole program when it starts with `import zudb`, which is
-the rule the README follows: a block that stands on its own carries its
-import, and a block that shows one call in the middle of a session does
-not. Each program runs in an interpreter of its own with a temporary
-directory as its working directory, because the file it writes is the
-one a reader would find beside them afterwards.
+A block is a whole program when it starts with an import, which is the
+rule the README follows: a block that stands on its own opens with what
+it imports, and a block that shows one call in the middle of a session
+opens with the call. Each program runs in an interpreter of its own
+with a temporary directory as its working directory, because the file
+it writes is the one a reader would find beside them afterwards.
 """
 
 from __future__ import annotations
@@ -44,7 +44,7 @@ def blocks(language: str) -> list[str]:
 
 def programs() -> list[str]:
     """The blocks that are whole programs."""
-    return [block for block in blocks("python") if block.startswith("import zudb")]
+    return [block for block in blocks("python") if block.startswith("import ")]
 
 
 def run(program: str, where: Path) -> subprocess.CompletedProcess[str]:
@@ -60,7 +60,7 @@ def run(program: str, where: Path) -> subprocess.CompletedProcess[str]:
 
 def test_the_readme_prints_programs_and_not_fragments() -> None:
     """The rule above holds: the page has both kinds and knows which."""
-    assert len(programs()) == 2, "the README's whole programs"
+    assert len(programs()) == 3, "the README's whole programs"
     assert len(blocks("python")) > len(programs()), "and its fragments"
 
 
@@ -77,6 +77,15 @@ def test_the_sixty_second_snippet_runs_as_printed(tmp_path: Path) -> None:
     # A reader runs it in the directory they are standing in, and the
     # database is there when it finishes.
     assert (tmp_path / "social.zu1").is_file()
+
+
+def test_the_event_loop_snippet_runs_as_printed(tmp_path: Path) -> None:
+    """The third block: the same two calls, awaited."""
+    snippet = programs()[2]
+    assert "zudb.aio.connect" in snippet and "asyncio.run" in snippet
+    done = run(snippet, tmp_path)
+    assert done.returncode == 0, done.stderr
+    assert done.stdout.split() == ["ada"]
 
 
 @pytest.mark.parametrize("index", range(len(programs())))
