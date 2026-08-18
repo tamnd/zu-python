@@ -19,8 +19,9 @@ use zudb::{Config, Database, Interrupt};
 
 use crate::appender::Appender;
 use crate::columns;
-use crate::error::{closed, to_py_err};
+use crate::error::{closed, programming, to_py_err};
 use crate::interrupt;
+use crate::txn::Transaction;
 use crate::value::{Names, from_py, to_py};
 
 /// What a capsule holding an Arrow stream is called. The name is part
@@ -130,6 +131,52 @@ impl Connection {
         self.execute(py, statement, params)
     }
 
+    /// Starts a transaction and hands it back for a `with` block.
+    ///
+    /// Several statements as one unit of work: the block commits when
+    /// it ends and rolls back when it raises, which is the failure
+    /// worth writing this for, since it is the one nobody wrote a
+    /// handler for.
+    ///
+    /// It starts here rather than at the `with`, so a transaction that
+    /// cannot start says so at the line that asked for one. A
+    /// connection is inside one transaction at a time, and asking for a
+    /// second while the first is running is refused by the engine
+    /// rather than nested, because a transaction inside a transaction
+    /// would have to invent an answer for what a rollback of the inner
+    /// one undoes.
+    ///
+    /// `read_only=True` starts one that refuses to write, at the
+    /// statement that writes rather than at the block that would have
+    /// written.
+    #[pyo3(signature = (*, read_only = false))]
+    fn transaction(slf: Py<Self>, py: Python<'_>, read_only: bool) -> PyResult<Transaction> {
+        Transaction::start(py, slf, read_only)
+    }
+
+    /// Whether an explicit transaction is running on this connection.
+    ///
+    /// The statements a program writes outside one are each a
+    /// transaction of their own, so this is false on a connection that
+    /// is writing perfectly well. It answers what is true between
+    /// statements, which is the only moment a caller can ask in: asking
+    /// while another thread is inside a statement waits for that
+    /// statement, since the answer belongs to the session and the
+    /// session is what the statement is holding.
+    #[getter]
+    fn in_transaction(&self, py: Python<'_>) -> PyResult<bool> {
+        if !self.alive.load(Ordering::Acquire) {
+            return Err(closed(py, "this connection"));
+        }
+        py.detach(|| {
+            self.inner.lock().ok().and_then(|mut held| {
+                held.as_mut()
+                    .map(|conn| conn.session_mut().in_transaction())
+            })
+        })
+        .ok_or_else(|| closed(py, "this connection"))
+    }
+
     /// Opens an appender on `table`, for loading rows into a database
     /// that already exists.
     ///
@@ -138,7 +185,20 @@ impl Connection {
     /// in columns and writes each batch as one commit. The table has to
     /// be there already, since an appender adds rows to a table and
     /// does not make one.
+    ///
+    /// It is refused inside a transaction. An appender's batches are
+    /// commits of their own and a rollback does not take them back, so
+    /// an appender opened inside a `with conn.transaction()` would
+    /// promise a span it is not in. Load first, then transact, or write
+    /// the rows as statements.
     fn appender(slf: Py<Self>, py: Python<'_>, table: &str) -> PyResult<Appender> {
+        if slf.borrow(py).in_transaction(py)? {
+            return Err(programming(
+                py,
+                "an appender writes its own commits, which a rollback does not take \
+                 back, so one cannot be opened inside a transaction",
+            ));
+        }
         Appender::open(py, slf, table)
     }
 
@@ -266,6 +326,17 @@ impl Connection {
             path,
             read_only,
         })
+    }
+
+    /// Runs a statement that takes no parameters and gives back
+    /// nothing, which is what the three transaction words are.
+    ///
+    /// It goes through `execute` rather than around it, so a `COMMIT`
+    /// waits for the connection's lock, releases the GIL and feels a
+    /// `Ctrl-C` exactly as every other statement does. The result is
+    /// dropped, since the words return no columns.
+    pub(crate) fn run(&self, py: Python<'_>, statement: &str) -> PyResult<()> {
+        self.execute(py, statement, None).map(|_| ())
     }
 }
 

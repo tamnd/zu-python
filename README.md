@@ -75,6 +75,24 @@ An appender nobody closed is the one mistake that cannot be reported where it ha
 
 On this machine 200,000 rows of an integer and a string take 11 ms to buffer through `append_rows` and 93 ms to flush, which is 1.9 million rows a second including the commit. The same rows one call at a time cost 32 ms of buffering, since a call is a call. Against `INSERT`, 2,000 rows take 32 seconds a row at a time and 28 ms through an appender, and the gap widens with the table because every `INSERT` is a commit and a fold.
 
+## Several statements as one unit of work
+
+Every statement already runs in a transaction of its own, so this is not what makes a write atomic. What it holds is the span: two statements are one unit, and the block rolls back when it raises, which is the failure worth writing it for since it is the one nobody wrote a handler for.
+
+```python
+with conn.transaction():
+    conn.execute("INSERT (a:account {uid: 1, balance: 100})")
+    conn.execute("INSERT (b:account {uid: 2, balance: 0})")
+```
+
+It starts at the call rather than at the `with`, so a transaction that cannot start says so at the line that asked for one, and `commit()` and `rollback()` are there for a caller who would rather say when. A block whose transaction has already ended is left alone on the way out, which is what lets a program commit early and carry on, and ending one twice is refused rather than ignored, because the statements between the two are in neither of them. `conn.in_transaction` answers which side of the block a program is on.
+
+`transaction(read_only=True)` starts one that refuses to write, at the statement that writes rather than at the block that would have written. One transaction runs at a time and a second is refused rather than nested, since a rollback of an inner one would have to invent an answer for what it undoes. The three words underneath are `START TRANSACTION`, `COMMIT` and `ROLLBACK`, and they all still work written out.
+
+An appender is refused inside a transaction. Its batches are commits of their own and a rollback does not take them back, so an appender opened in a block would promise a span it is not in: load first, then transact. A statement that failed leaves the transaction running, because the engine does not end one on a failed statement and the block that opened it is still the thing that closes it. A connection closed with work uncommitted drops that work, which is the same answer the block would have given.
+
+The wrapper costs 5 microseconds for an empty transaction, so what it costs is what the engine charges. On this machine that is more rather than less: 200 `INSERT`s cost 2.2 seconds each committing on its own and 3.3 seconds inside one transaction, and reads cost the same either way. A transaction here is worth taking for the span it holds and not for the time it saves, and the v0 write path is where that number has to change.
+
 ## Reading a result as columns
 
 A result is rows to iterate and columns to hand to something else. The columns go out over the Arrow C Data Interface, so pyarrow, pandas and polars each read the same buffers and none of them gets a Python object per cell.
@@ -117,7 +135,7 @@ The stub is checked against the module it describes in CI: griffe reads the stub
 
 ## What works today
 
-The list above is what this client is for. What it does so far is the core of it: `connect`, `execute` and `sql` with named parameters, results that iterate and fetch, values as Python objects both ways including dates, times, datetimes and durations, `Node`, `Rel` and `Path` as classes, `load` for building a graph with edges in it, an appender for growing one, every condition as an exception class carrying its code, its position and its documentation link, results as Arrow columns and as pandas and polars frames, stubs inside the wheel with a gate that keeps them true, the GIL released around every statement, every load and every copy out, and `Ctrl-C` and `interrupt()` stopping a statement without touching the connection under it. `register` is next, and each one lands with the tests that say it works.
+The list above is what this client is for. What it does so far is the core of it: `connect`, `execute` and `sql` with named parameters, results that iterate and fetch, values as Python objects both ways including dates, times, datetimes and durations, `Node`, `Rel` and `Path` as classes, `load` for building a graph with edges in it, an appender for growing one, transactions as a context manager that commits at the end of a block and rolls back when it raises, every condition as an exception class carrying its code, its position and its documentation link, results as Arrow columns and as pandas and polars frames, stubs inside the wheel with a gate that keeps them true, the GIL released around every statement, every load and every copy out, and `Ctrl-C` and `interrupt()` stopping a statement without touching the connection under it. `register` is next, and each one lands with the tests that say it works.
 
 ## Wheels
 

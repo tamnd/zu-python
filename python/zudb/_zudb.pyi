@@ -76,6 +76,13 @@ class Connection:
     def sql(self, statement: str, params: Mapping[str, Value] | None = None) -> Result:
         """The same call, named for the way it reads in a notebook."""
 
+    def transaction(self, *, read_only: bool = False) -> Transaction:
+        """Starts a transaction and hands it back for a `with` block."""
+
+    @property
+    def in_transaction(self) -> bool:
+        """Whether an explicit transaction is running on this connection."""
+
     def appender(self, table: str) -> Appender:
         """Opens an appender on `table`, for loading rows into a database that already exists."""
 
@@ -83,6 +90,27 @@ class Connection:
         """Closes the connection and frees what it held."""
 
     def __enter__(self) -> Connection: ...
+    def __exit__(self, *_exception: object) -> bool: ...
+    def __repr__(self) -> str: ...
+
+class Transaction:
+    """A transaction that has been started and not yet ended."""
+
+    @property
+    def read_only(self) -> bool:
+        """Whether it was started `READ ONLY`."""
+
+    @property
+    def done(self) -> bool:
+        """Whether this transaction has already been committed or rolled back."""
+
+    def commit(self) -> None:
+        """Ends the transaction and keeps what it wrote."""
+
+    def rollback(self) -> None:
+        """Ends the transaction and throws away what it wrote."""
+
+    def __enter__(self) -> Transaction: ...
     def __exit__(self, *_exception: object) -> bool: ...
     def __repr__(self) -> str: ...
 
