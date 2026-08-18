@@ -14,6 +14,7 @@
 
 mod conn;
 mod error;
+mod load;
 mod value;
 
 use std::path::PathBuf;
@@ -46,6 +47,7 @@ fn _zudb(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add("__engine_version__", env!("CARGO_PKG_VERSION"))?;
     module.add("__abi_version__", zudb::C_ABI_VERSION)?;
     module.add_function(wrap_pyfunction!(connect, module)?)?;
+    module.add_function(wrap_pyfunction!(load::load, module)?)?;
     module.add_class::<conn::Connection>()?;
     module.add_class::<conn::Result>()?;
     module.add_class::<value::Node>()?;

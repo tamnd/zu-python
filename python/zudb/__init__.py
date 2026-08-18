@@ -14,7 +14,17 @@ nothing to run, and no server to connect to. Statements are ISO/IEC
 
 from __future__ import annotations
 
-from ._zudb import Connection, Duration, Node, Path, Rel, Result, __abi_version__, connect
+from ._zudb import (
+    Connection,
+    Duration,
+    Node,
+    Path,
+    Rel,
+    Result,
+    __abi_version__,
+    connect,
+    load,
+)
 from .errors import (
     ConnectionError,
     DataError,
@@ -30,6 +40,7 @@ __version__ = "0.0.1"
 
 __all__ = [
     "connect",
+    "load",
     "Connection",
     "Result",
     "Node",

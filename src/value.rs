@@ -97,10 +97,11 @@ impl Node {
 
 /// One edge of the graph.
 ///
-/// `ord` is which edge this is of the ones running from `src` to
-/// `dst`, since a pair of endpoints can be joined more than once and
-/// each of those edges carries its own properties. It is the field a
-/// caller usually ignores and the one nothing else can replace.
+/// `ord` is where the edge's properties sit, which is its place in the
+/// order the table was loaded in. That is what names an edge: a pair of
+/// endpoints does not, since the same pair may run more than once and
+/// each of those edges carries its own values. It is the field a caller
+/// usually ignores and the one nothing else can replace.
 #[pyclass(module = "zudb", frozen, eq, hash, skip_from_py_object)]
 #[derive(PartialEq, Eq, Hash, Clone)]
 pub struct Rel {
@@ -161,6 +162,20 @@ impl Path {
         self.every(py, 1)
     }
 
+    fn __len__(&self, py: Python<'_>) -> usize {
+        self.elements.bind(py).len() / 2
+    }
+
+    fn __repr__(&self, py: Python<'_>) -> String {
+        format!("Path({} hops)", self.__len__(py))
+    }
+}
+
+impl Path {
+    /// Every other element starting at `from`, which is the nodes when
+    /// that is zero and the edges when it is one. Outside `pymethods`
+    /// because it is how the two getters are written and not a third
+    /// thing to call from Python.
     fn every<'py>(&self, py: Python<'py>, from: usize) -> PyResult<Bound<'py, PyList>> {
         let all = self.elements.bind(py);
         let picked = (from..all.len())
@@ -168,14 +183,6 @@ impl Path {
             .map(|ix| all.get_item(ix))
             .collect::<PyResult<Vec<_>>>()?;
         PyList::new(py, picked)
-    }
-
-    fn __len__(&self, py: Python<'_>) -> usize {
-        self.elements.bind(py).len() / 2
-    }
-
-    fn __repr__(&self, py: Python<'_>) -> String {
-        format!("Path({} hops)", self.__len__(py))
     }
 }
 
@@ -535,7 +542,7 @@ fn time_from_py(t: &Bound<'_, PyTime>) -> PyResult<Value> {
 
 /// The clock reading of a `time` or a `datetime`, in nanoseconds since
 /// midnight.
-fn clock_nanos(value: &Bound<'_, PyAny>) -> PyResult<i64> {
+pub fn clock_nanos(value: &Bound<'_, PyAny>) -> PyResult<i64> {
     let hour: i64 = value.getattr("hour")?.extract()?;
     let minute: i64 = value.getattr("minute")?.extract()?;
     let second: i64 = value.getattr("second")?.extract()?;

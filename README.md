@@ -32,9 +32,29 @@ The interesting parts:
 - **Complete `.pyi` stubs inside the wheel**, checked against the runtime in CI, so mypy and pyright and your editor all work with no extra install.
 - **Graph values are real classes.** `Node`, `Rel`, and `Path` have `.labels`, `.id`, `.properties`, and an HTML repr. Not dicts, because a dict cannot tell a property named `labels` apart from the label set.
 
+## Building a graph
+
+A statement writes one row at a time, which is the wrong shape for loading data and cannot make a rel table at all. `load` is the other shape: a table's columns whole, the edges between them whole, one file written once.
+
+```python
+zudb.load(
+    "social.zu1",
+    nodes="person",
+    rels="knows",
+    columns={"uid": [1, 2, 3], "name": ["ada", "grace", "kay"]},
+    edges=[(0, 1), (1, 2)],
+)
+
+with zudb.connect("social.zu1", read_only=True) as conn:
+    for a, b in conn.execute("MATCH (a:person)-[:knows]->(b:person) RETURN a.name AS a, b.name AS b"):
+        print(a, "knows", b)
+```
+
+Edges name rows by position, counting from zero, because at load time a row has no other name. Columns may hold booleans, integers, floats, strings, dates, times, datetimes or durations, one kind to a column, and the GIL is released for the write.
+
 ## What works today
 
-The list above is what this client is for. What it does so far is the core of it: `connect`, `execute` and `sql` with named parameters, results that iterate and fetch, values as Python objects both ways including dates, times, datetimes and durations, `Node`, `Rel` and `Path` as classes, every condition as an exception class carrying its code, its position and its documentation link, and the GIL released around every statement. Arrow, `register`, the stubs and the interrupt are next, and each one lands with the tests that say it works.
+The list above is what this client is for. What it does so far is the core of it: `connect`, `execute` and `sql` with named parameters, results that iterate and fetch, values as Python objects both ways including dates, times, datetimes and durations, `Node`, `Rel` and `Path` as classes, `load` for building a graph with edges in it, every condition as an exception class carrying its code, its position and its documentation link, and the GIL released around every statement and every load. Arrow, `register`, the stubs and the interrupt are next, and each one lands with the tests that say it works.
 
 ## Wheels
 
