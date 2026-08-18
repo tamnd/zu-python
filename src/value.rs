@@ -336,6 +336,15 @@ pub fn to_py<'py>(py: Python<'py>, value: &Value, names: &Names) -> PyResult<Bou
             .into_any()
         }
         Value::Temporal(t) => temporal_to_py(py, *t)?,
+        // GV60 and GV61. A reference goes across as the string that
+        // names it, `GRAPH /social` or `BINDING TABLE #3 (2 columns, 7
+        // rows)`, which is what the shell prints and what the ABI's
+        // JSON carries. A handle is a reference on purpose: the graph
+        // is in the file and the table is behind the handle, so
+        // building a Python object that held either would copy the
+        // thing the value was passed by reference to avoid.
+        Value::Graph(handle) => handle.label().into_pyobject(py)?.into_any(),
+        Value::BindingTable(table) => table.label().into_pyobject(py)?.into_any(),
         // The executor settles a chain into its edge list before any
         // value leaves the pipeline, so a result never holds one and
         // seeing one here is a bug in the engine rather than something

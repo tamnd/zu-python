@@ -31,6 +31,7 @@
 
 use std::sync::{Mutex, MutexGuard};
 
+use pyo3::exceptions::PyResourceWarning;
 use pyo3::prelude::*;
 use pyo3::types::PyTuple;
 use zudb::zu1::catalog::Catalog;
@@ -295,6 +296,57 @@ impl Appender {
             "<zudb.Appender {}, {} buffered, {} committed{closed}>",
             self.table, state.buffered, state.committed
         ))
+    }
+}
+
+/// An appender the collector took while it still held rows says so.
+///
+/// The rows are gone by then, and going quietly is the failure mode
+/// worth a warning: the caller wrote a loop that appended a million
+/// rows, never closed the appender, and got a database with nothing in
+/// it and no complaint about it. Flushing here instead is what the
+/// Rust appender does when it is dropped, and it is not available to
+/// this one: a collector runs whenever it likes, including while
+/// another thread is inside a statement on the same connection, and a
+/// commit from there would be a write nobody asked for at a moment
+/// nobody chose.
+///
+/// `ResourceWarning` is the class Python already uses for a file that
+/// was never closed, which is the same mistake with the same cure, and
+/// it is silent by default and loud under `-W error` and under pytest.
+impl Drop for Appender {
+    fn drop(&mut self) {
+        let Ok(state) = self.state.lock() else { return };
+        if !state.open || state.buffered == 0 {
+            return;
+        }
+        let Ok(message) = std::ffi::CString::new(format!(
+            "appender on '{}' was collected with {} row{} buffered and never closed, \
+             so they were discarded: close it, or hold it in a `with` block",
+            self.table,
+            state.buffered,
+            if state.buffered == 1 { "" } else { "s" },
+        )) else {
+            return;
+        };
+        Python::attach(|py| {
+            // A collector runs wherever it likes, including in the
+            // middle of raising something else, and warning while an
+            // exception is set is an error in itself. The one being
+            // raised is put aside and put back, so the warning is an
+            // aside rather than a thing that replaces the failure the
+            // caller is about to see.
+            let raising = PyErr::take(py);
+            // A warning turned into an error by the caller's filters
+            // has nowhere to go from a destructor, so it is written to
+            // stderr the way Python writes any exception raised in one.
+            if let Err(raised) = PyErr::warn(py, &py.get_type::<PyResourceWarning>(), &message, 1) {
+                raised.write_unraisable(py, None);
+            }
+            if let Some(raising) = raising {
+                raising.restore(py);
+            }
+        });
     }
 }
 
