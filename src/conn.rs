@@ -9,16 +9,18 @@
 
 use std::ffi::CStr;
 use std::path::PathBuf;
-use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use pyo3::prelude::*;
 use pyo3::types::{PyCapsule, PyDict, PyList, PyTuple};
 use zudb::query::{QueryResult, Value};
-use zudb::{Config, Database};
+use zudb::{Config, Database, Interrupt};
 
 use crate::appender::Appender;
 use crate::columns;
 use crate::error::{closed, to_py_err};
+use crate::interrupt;
 use crate::value::{Names, from_py, to_py};
 
 /// What a capsule holding an Arrow stream is called. The name is part
@@ -44,7 +46,25 @@ pub struct Connection {
     /// thread in the process for the length of somebody else's
     /// statement, and would deadlock against the thread inside that
     /// statement, which needs the GIL back to return.
-    pub(crate) inner: Mutex<Option<zudb::Connection>>,
+    ///
+    /// Counted rather than plain, because the thread a statement runs
+    /// on takes a share of it: a job handed to that thread outlives the
+    /// call that made it in the type system even though it never does
+    /// in fact.
+    pub(crate) inner: Arc<Mutex<Option<zudb::Connection>>>,
+    /// The thread statements run on where a `Ctrl-C` can arrive,
+    /// started at the first one that needs it and kept for the rest.
+    runner: OnceLock<interrupt::Runner>,
+    /// The word the running statement reads, held out here rather than
+    /// reached through the lock. A stop that had to wait for the
+    /// connection to be free could only ever arrive after the statement
+    /// it was meant to stop.
+    stop: Interrupt,
+    /// Whether the connection is still open, kept beside the lock for
+    /// the same reason: asking a connection whether it is closed, or
+    /// asking it to stop, should not queue behind a ten second
+    /// statement.
+    alive: AtomicBool,
     #[pyo3(get)]
     path: PathBuf,
     #[pyo3(get)]
@@ -67,27 +87,30 @@ impl Connection {
         params: Option<&Bound<'_, PyDict>>,
     ) -> PyResult<Result> {
         let params = bind(params)?;
-        let borrowed: Vec<(&str, Value)> = params
-            .iter()
-            .map(|(name, value)| (name.as_str(), value.clone()))
-            .collect();
+        // Owned rather than borrowed, both of them, because the thread
+        // that runs the statement is not this one and the borrow would
+        // have to say so. It is two allocations against a statement,
+        // which is nothing beside the parse it is about to have.
+        let statement = statement.to_string();
         // The GIL goes down for the whole statement, waiting for the
         // connection's own lock included. That is the point of a
         // compiled engine in a Python process: another thread runs
-        // while this one is inside the executor, and the signal
-        // handler gets to run too, which is what lets a `Ctrl-C`
-        // arrive at all. Waiting for the lock with the GIL held would
-        // be worse than slow: the thread inside the statement has to
-        // take the GIL back to return, and it could not.
-        let (result, names) = py
-            .detach(|| -> std::result::Result<_, Trouble> {
-                let mut held = self.inner.lock().map_err(|_| Trouble::Closed)?;
-                let conn = held.as_mut().ok_or(Trouble::Closed)?;
+        // while this one is inside the executor. Where a `Ctrl-C` can
+        // arrive the statement goes on the connection's own thread and
+        // this one waits for it, which is the only way a press is felt
+        // before the statement ends.
+        let (result, names) =
+            interrupt::watched(py, &self.runner, &self.inner, &self.stop, move |conn| {
+                let borrowed: Vec<(&str, Value)> = params
+                    .iter()
+                    .map(|(name, value)| (name.as_str(), value.clone()))
+                    .collect();
                 let names = Names::of(conn.session_mut().catalog());
-                let result = conn.query_with(statement, &borrowed)?;
-                Ok((result, names))
+                conn.query_with(&statement, &borrowed)
+                    .map(|result| (result, names))
             })
-            .map_err(|trouble| trouble.raise(py))?;
+            .map_err(|stopped| stopped.raise(py))?
+            .map_err(|err| to_py_err(py, err))?;
         Ok(Result {
             result,
             names,
@@ -119,6 +142,40 @@ impl Connection {
         Appender::open(py, slf, table)
     }
 
+    /// Asks the statement running on this connection to stop.
+    ///
+    /// The one call meant to be made from another thread while the
+    /// connection is busy, which is why it waits for nothing: the
+    /// statement it stops is the one holding everything a call that
+    /// waited would be waiting for. The statement raises
+    /// `zudb.Interrupted` and the connection is exactly as it was, so
+    /// the next statement on it starts warm. That is the difference
+    /// between stopping a statement and closing a connection.
+    ///
+    /// With nothing running this does nothing. It does not arm a stop
+    /// for the next statement, because a statement nobody has run yet
+    /// is not one anybody has waited too long for.
+    fn interrupt(&self, py: Python<'_>) -> PyResult<()> {
+        if !self.alive.load(Ordering::Acquire) {
+            return Err(closed(py, "this connection"));
+        }
+        self.stop.stop();
+        Ok(())
+    }
+
+    /// How many rows the statement running on this connection has read
+    /// out of storage, for showing a person that something is
+    /// happening.
+    ///
+    /// Rows read rather than rows answered, because the statement
+    /// somebody is waiting on is exactly the one that reads a hundred
+    /// million rows to answer one. It starts at zero at each statement
+    /// and holds its last value once one ends.
+    #[getter]
+    fn rows_read(&self) -> u64 {
+        self.stop.rows()
+    }
+
     /// Closes the connection and frees what it held.
     ///
     /// Doing it twice is not an error, because a `with` block that
@@ -131,13 +188,21 @@ impl Connection {
             if let Ok(mut held) = self.inner.lock() {
                 drop(held.take());
             }
+            // Written after the drop rather than before it, so that a
+            // connection reports itself open until it really is not,
+            // and a poisoned lock reports itself closed because
+            // nothing can be run on one.
+            self.alive.store(false, Ordering::Release);
         });
     }
 
     /// Whether this connection is still open.
+    ///
+    /// Answered from a word beside the lock rather than through it, so
+    /// that asking does not queue behind whatever is running.
     #[getter]
-    fn closed(&self, py: Python<'_>) -> bool {
-        py.detach(|| self.inner.lock().map(|held| held.is_none()).unwrap_or(true))
+    fn closed(&self) -> bool {
+        !self.alive.load(Ordering::Acquire)
     }
 
     fn __enter__(slf: PyRef<'_, Self>) -> PyRef<'_, Self> {
@@ -153,8 +218,8 @@ impl Connection {
         false
     }
 
-    fn __repr__(&self, py: Python<'_>) -> String {
-        let state = if self.closed(py) { ", closed" } else { "" };
+    fn __repr__(&self) -> String {
+        let state = if self.closed() { ", closed" } else { "" };
         format!("<zudb.Connection {}{state}>", self.path.display())
     }
 }
@@ -189,36 +254,18 @@ impl Connection {
             }
             .and_then(|db| db.connect())
         });
+        let opened = opened.map_err(|err| to_py_err(py, err))?;
         Ok(Connection {
-            inner: Mutex::new(Some(opened.map_err(|err| to_py_err(py, err))?)),
+            // Taken here, once, because every later reader of it wants
+            // it while the connection is busy and taking it then would
+            // mean waiting for the statement it is there to stop.
+            stop: opened.interrupt(),
+            inner: Arc::new(Mutex::new(Some(opened))),
+            runner: OnceLock::new(),
+            alive: AtomicBool::new(true),
             path,
             read_only,
         })
-    }
-}
-
-/// What can go wrong inside a statement, with the GIL down and no way
-/// to build a Python exception yet.
-enum Trouble {
-    Closed,
-    Engine(zudb::ZuError),
-}
-
-impl From<zudb::ZuError> for Trouble {
-    fn from(err: zudb::ZuError) -> Trouble {
-        Trouble::Engine(err)
-    }
-}
-
-impl Trouble {
-    fn raise(self, py: Python<'_>) -> PyErr {
-        match self {
-            // A connection whose lock a panic left poisoned is a
-            // connection nothing can be run on again, which is the
-            // same fact as a closed one and reads better as one.
-            Trouble::Closed => closed(py, "this connection"),
-            Trouble::Engine(err) => to_py_err(py, err),
-        }
     }
 }
 

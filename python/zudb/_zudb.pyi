@@ -63,6 +63,13 @@ class Connection:
     def closed(self) -> bool:
         """Whether this connection is still open."""
 
+    @property
+    def rows_read(self) -> int:
+        """How many rows the statement running on this connection has read out of storage."""
+
+    def interrupt(self) -> None:
+        """Asks the statement running on this connection to stop."""
+
     def execute(self, statement: str, params: Mapping[str, Value] | None = None) -> Result:
         """Runs one statement and gives back its rows."""
 
