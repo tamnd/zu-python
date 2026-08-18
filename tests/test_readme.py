@@ -60,7 +60,7 @@ def run(program: str, where: Path) -> subprocess.CompletedProcess[str]:
 
 def test_the_readme_prints_programs_and_not_fragments() -> None:
     """The rule above holds: the page has both kinds and knows which."""
-    assert len(programs()) == 3, "the README's whole programs"
+    assert len(programs()) == 4, "the README's whole programs"
     assert len(blocks("python")) > len(programs()), "and its fragments"
 
 
@@ -86,6 +86,15 @@ def test_the_event_loop_snippet_runs_as_printed(tmp_path: Path) -> None:
     done = run(snippet, tmp_path)
     assert done.returncode == 0, done.stderr
     assert done.stdout.split() == ["ada"]
+
+
+def test_the_dbapi_snippet_runs_as_printed(tmp_path: Path) -> None:
+    """The fourth block: a cursor, a `?` parameter, a block that commits."""
+    snippet = programs()[3]
+    assert "zudb.dbapi.connect" in snippet and "fetchall" in snippet
+    done = run(snippet, tmp_path)
+    assert done.returncode == 0, done.stderr
+    assert done.stdout.strip() == "[('ada',)]"
 
 
 @pytest.mark.parametrize("index", range(len(programs())))
