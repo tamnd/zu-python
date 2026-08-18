@@ -1,14 +1,28 @@
-//! A frame of columns, read out of whatever the caller is holding.
+//! A frame of columns, described where the caller keeps them.
 //!
 //! The way in for data that is already in columns. pandas, polars and
 //! pyarrow all hand out an Arrow stream through the PyCapsule protocol,
-//! and reading one costs a memcpy per column and no Python objects at
-//! all, which is the same trade the way out makes and for the same
-//! reason.
+//! and what comes back from one is buffers: eight-byte words back to
+//! back, one bit a row for a boolean, characters end to end with
+//! offsets cutting them up. That is how this engine lays a column out
+//! too, so what this module produces is not a copy of any of it but a
+//! description: where each column is, how wide its values are, and what
+//! they mean.
 //!
-//! What comes back is the same [`Column`] buffers a load and an
-//! appender already use, so nothing downstream of here knows whether
-//! the rows arrived as Arrow or as Python lists.
+//! Two things do copy, and both are said rather than hidden. A stream
+//! of several batches is concatenated into one, because a column of a
+//! table is one run of bytes and two batches are two of them; that is a
+//! memcpy per column and it happens once. A dictionary of Python lists
+//! is read into buffers of this module's own, because a list holds
+//! objects and a column holds numbers, so there is nothing there to
+//! point at.
+//!
+//! What keeps the bytes alive is [`Held`], which the frame holds and
+//! which the engine drops when the last table naming those bytes goes.
+//! Dropping it releases the Arrow arrays back to whoever exported them,
+//! and that release may reach into an interpreter, so it takes the GIL
+//! first: the engine drops a frame on whichever thread finished with
+//! it, and that is not always a thread of Python's.
 //!
 //! There is no null anywhere in it. A property that is null is one no
 //! row of this engine can hold, so a column with a gap in it can only
@@ -17,25 +31,20 @@
 //! knows only that something somewhere was empty.
 
 use std::ffi::CStr;
+use std::ptr::NonNull;
+use std::sync::Arc;
 
-use arrow::array::{
-    Array, ArrayRef, BooleanArray, LargeStringArray, PrimitiveArray, StringArray, StringViewArray,
-};
-use arrow::datatypes::{
-    DataType, Date32Type, DurationMicrosecondType, DurationMillisecondType, DurationNanosecondType,
-    DurationSecondType, Float32Type, Float64Type, Int8Type, Int16Type, Int32Type, Int64Type,
-    IntervalUnit, IntervalYearMonthType, Time32MillisecondType, Time32SecondType,
-    Time64MicrosecondType, Time64NanosecondType, TimeUnit, TimestampMicrosecondType,
-    TimestampMillisecondType, TimestampNanosecondType, TimestampSecondType, UInt8Type, UInt16Type,
-    UInt32Type, UInt64Type,
-};
+use arrow::array::{Array, ArrayRef, LargeStringArray, StringArray};
+use arrow::compute::{concat, concat_batches};
+use arrow::datatypes::{DataType, IntervalUnit, TimeUnit};
 use arrow::ffi_stream::{ArrowArrayStreamReader, FFI_ArrowArrayStream};
 use arrow::record_batch::{RecordBatch, RecordBatchReader};
 use pyo3::prelude::*;
 use pyo3::types::{PyCapsule, PyDict};
-use zu_common::DurationKind;
+use zu_common::{DurationKind, FloatBits, IntBits, LogicalType};
+use zudb::{Column, Layout};
 
-use crate::buffer::{Column, type_name};
+use crate::buffer::{self, type_name};
 use crate::columns::Snag;
 use crate::load;
 
@@ -43,13 +52,92 @@ use crate::load;
 /// checks before it reads the pointer.
 const STREAM: &CStr = c"arrow_array_stream";
 
-/// Columns, in the order the frame holds them, and how long they are.
-pub struct Frame {
-    pub columns: Vec<(String, Column)>,
-    pub rows: usize,
+/// What a registered frame's bytes are, and the thing whose life is
+/// their life.
+///
+/// One of the two fields is filled. The batch is the arrays a producer
+/// handed over, held so the buffers underneath them stay where they
+/// are; the owned vectors are what this client built out of Python
+/// objects, for a caller with no frame library installed.
+pub struct Held {
+    /// An `Option` only so that [`Drop`] can take it, which is where
+    /// the GIL has to be held.
+    batch: Option<RecordBatch>,
+    owned: Vec<Bytes>,
 }
 
-/// Reads whatever the caller handed over into columns.
+/// Releasing an imported Arrow array calls the callback the producer
+/// gave with it, and a producer that is pyarrow drops Python objects in
+/// that callback. The engine drops a frame when the last table naming
+/// it goes, which may be inside a statement on a thread holding no GIL,
+/// so this takes one. Attaching on a thread that already has it costs a
+/// check.
+impl Drop for Held {
+    fn drop(&mut self) {
+        if self.batch.is_some() {
+            Python::attach(|_| drop(self.batch.take()));
+        }
+    }
+}
+
+/// One column this client built, because a list of Python objects is
+/// not a column and something has to hold the bytes.
+///
+/// The variants are the layouts the engine reads rather than the types
+/// a value has: a date and a count of days are one variant, and what
+/// tells them apart is the logical type recorded beside the pointer.
+enum Bytes {
+    /// Signed 64-bit values, whatever they count.
+    Counts(Vec<u64>),
+    /// Signed 32-bit values, which is what a date is.
+    Days(Vec<i32>),
+    Floats(Vec<f64>),
+    /// One bit a row, low bit of the first byte first.
+    Bits(Vec<u8>),
+    /// Arrow's `Utf8`: characters end to end and `rows + 1` offsets.
+    Text {
+        data: Vec<u8>,
+        offsets: Vec<i32>,
+    },
+}
+
+/// A frame as the engine is about to be told about it.
+///
+/// The columns hold raw pointers into what `held` keeps alive, which is
+/// why the two travel together and why neither is any use without the
+/// other.
+pub struct Described {
+    pub columns: Vec<Column>,
+    pub rows: u64,
+    held: Arc<Held>,
+}
+
+// A pointer is not `Send`, because Rust cannot know what it addresses.
+// These address buffers the `Arc` in the same struct keeps alive, and
+// that `Arc` is `Send` and `Sync`, so a description travels wherever
+// the thing it describes does. Nothing writes through them.
+unsafe impl Send for Described {}
+
+impl Described {
+    /// Registers this as a table named `name` on `engine`.
+    ///
+    /// Every pointer in it addresses a buffer the `Arc` handed over
+    /// with them keeps alive, which is what building one of these
+    /// promises and what nothing between there and here undoes, so the
+    /// `unsafe` that [`zudb::Frame::new`] asks for is discharged where
+    /// the buffers were described rather than here.
+    pub fn register(self, engine: &mut zudb::Connection, name: &str) -> zudb::Result<()> {
+        let Described {
+            columns,
+            rows,
+            held,
+        } = self;
+        let frame = unsafe { zudb::Frame::new(name, rows, columns, held) }?;
+        engine.register(frame)
+    }
+}
+
+/// Reads whatever the caller handed over into a description of it.
 ///
 /// Two shapes, and the first of them is the one that matters: anything
 /// that speaks Arrow, which is every frame library worth naming, and a
@@ -57,14 +145,12 @@ pub struct Frame {
 /// Anything else is refused here rather than iterated hopefully,
 /// because the message a caller wants is the list of what would have
 /// worked.
-pub fn read(py: Python<'_>, data: &Bound<'_, PyAny>) -> PyResult<Frame> {
+pub fn read(py: Python<'_>, data: &Bound<'_, PyAny>) -> PyResult<Described> {
     if data.hasattr("__arrow_c_stream__")? {
         return from_arrow(py, data);
     }
     if let Ok(dict) = data.cast::<PyDict>() {
-        let columns = load::build(Some(dict))?;
-        let rows = columns.first().map(|(_, column)| column.len()).unwrap_or(0);
-        return Ok(Frame { columns, rows });
+        return from_lists(dict);
     }
     Err(pyo3::exceptions::PyTypeError::new_err(format!(
         "a frame is anything with `__arrow_c_stream__`, which a pandas, polars or pyarrow table \
@@ -78,11 +164,10 @@ pub fn read(py: Python<'_>, data: &Bound<'_, PyAny>) -> PyResult<Frame> {
 ///
 /// The GIL is held to pull each batch, because the producer on the far
 /// side of the stream may be Python and calling into an interpreter
-/// nobody is holding is how a process ends. It goes down again for the
-/// conversion, which is the part that touches every value and is pure
-/// Rust: a ten million row frame is a memcpy per column rather than ten
-/// million reference counts.
-fn from_arrow(py: Python<'_>, data: &Bound<'_, PyAny>) -> PyResult<Frame> {
+/// nobody is holding is how a process ends. It goes down for everything
+/// after that, which is pure Rust and, on the path that matters, walks
+/// the pointers rather than the rows.
+fn from_arrow(py: Python<'_>, data: &Bound<'_, PyAny>) -> PyResult<Described> {
     // No requested schema. Asking for one would mean casting on the
     // producer's side, and a producer that cannot cast is entitled to
     // refuse: what is wanted here is whatever it already has.
@@ -112,280 +197,436 @@ fn from_arrow(py: Python<'_>, data: &Bound<'_, PyAny>) -> PyResult<Frame> {
     };
     let reader =
         ArrowArrayStreamReader::try_new(stream).map_err(|err| Snag::Arrow(err).raise(py))?;
-
     let schema = reader.schema();
-    let mut columns: Vec<(String, Column)> = Vec::with_capacity(schema.fields().len());
-    for field in schema.fields() {
-        columns.push((
-            field.name().clone(),
-            start(field.name(), field.data_type())?,
-        ));
-    }
-    let mut rows = 0usize;
+    let mut batches = Vec::new();
     for batch in reader {
-        let batch = batch.map_err(|err| Snag::Arrow(err).raise(py))?;
-        let base = rows;
-        py.detach(|| take(&mut columns, &batch, base))
-            .map_err(|snag| snag.raise(py))?;
-        rows += batch.num_rows();
+        batches.push(batch.map_err(|err| Snag::Arrow(err).raise(py))?);
     }
-    Ok(Frame { columns, rows })
+
+    let batch = py
+        .detach(|| -> Result<RecordBatch, Snag> {
+            // One batch is the frame where it lies. Several are one
+            // memcpy per column, because a column of a table is one run
+            // of bytes and a table of two batches is two of them. None
+            // is an empty frame, which the caller refuses under the
+            // name it was asked to register.
+            let batch = match batches.len() {
+                1 => batches.pop().expect("the one batch"),
+                _ => concat_batches(&schema, &batches)?,
+            };
+            settled(batch)
+        })
+        .map_err(|snag| snag.raise(py))?;
+
+    let rows = batch.num_rows() as u64;
+    let mut columns = Vec::with_capacity(batch.num_columns());
+    for (at, array) in batch.columns().iter().enumerate() {
+        let name = batch.schema_ref().field(at).name();
+        let (ty, layout) = described(name, array)?;
+        columns.push(Column {
+            name: name.clone(),
+            ty,
+            layout,
+        });
+    }
+    Ok(Described {
+        columns,
+        rows,
+        held: Arc::new(Held {
+            batch: Some(batch),
+            owned: Vec::new(),
+        }),
+    })
 }
 
-/// The buffer a column of this Arrow type fills, or the reason there
-/// is none.
+/// A batch with everything about it that a pointer cannot express taken
+/// out of it.
 ///
-/// The type decides it and not the first value, which is the one thing
-/// a frame gives that a list of Python objects does not: an empty frame
-/// still knows what its columns are, and a column of floats that
-/// happens to start with a whole number is still a column of floats.
-fn start(name: &str, ty: &DataType) -> PyResult<Column> {
+/// A producer may hand over a slice of a longer array, and a slice does
+/// not start where its buffers do: a bitmap that begins partway into a
+/// byte and offsets that begin partway into their data are both things
+/// a bare pointer does not say. A skewed column is copied down to
+/// itself, which costs the rows it actually holds and no more, and
+/// every other column is left where it is.
+///
+/// Runs with the GIL down, so what is wrong comes back rather than
+/// being raised.
+fn settled(batch: RecordBatch) -> Result<RecordBatch, Snag> {
+    let mut columns = batch.columns().to_vec();
+    let mut skewed = false;
+    for column in &mut columns {
+        if offset(column) {
+            // An empty slice of it goes in front, because `concat` of
+            // one array hands that array straight back: the right
+            // answer for a concatenation and the wrong one here, where
+            // the copy is the whole point.
+            let nothing = column.slice(0, 0);
+            *column = concat(&[nothing.as_ref(), column.as_ref()])?;
+            skewed = true;
+        }
+    }
+    let batch = match skewed {
+        true => RecordBatch::try_new(batch.schema(), columns)?,
+        false => batch,
+    };
+    for (at, column) in batch.columns().iter().enumerate() {
+        whole(batch.schema_ref().field(at).name(), column)?;
+    }
+    Ok(batch)
+}
+
+/// Whether this column starts somewhere other than where its buffers
+/// do.
+///
+/// Two ways it can, because a slice reaches this by two roads. An array
+/// may carry the row offset itself, which is what `offset` is; or the
+/// producer may have handed the offset over already applied to the
+/// buffers, which is what an Arrow import does to a string column, and
+/// then the array counts from zero and its first offset does not.
+fn offset(array: &ArrayRef) -> bool {
+    if array.offset() != 0 {
+        return true;
+    }
+    let starts_at = |from: Option<i64>| from.is_some_and(|from| from != 0);
+    match array.data_type() {
+        DataType::Utf8 => starts_at(
+            array
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .and_then(|text| text.value_offsets().first().map(|&from| from as i64)),
+        ),
+        DataType::LargeUtf8 => starts_at(
+            array
+                .as_any()
+                .downcast_ref::<LargeStringArray>()
+                .and_then(|text| text.value_offsets().first().copied()),
+        ),
+        _ => false,
+    }
+}
+
+/// That a column has a value in every row of it.
+///
+/// Names the first row rather than the count, because a caller with a
+/// gap in a column wants to go and look at it.
+fn whole(name: &str, array: &ArrayRef) -> Result<(), Snag> {
+    if array.null_count() == 0 {
+        return Ok(());
+    }
+    let row = (0..array.len())
+        .find(|&row| array.is_null(row))
+        .unwrap_or(0);
+    Err(Snag::Value(format!(
+        "column '{name}' has no value at row {row}, and every column of a row holds one"
+    )))
+}
+
+/// Reads a dictionary of Python lists into buffers of this module's
+/// own.
+///
+/// The one path that copies, and it copies because there is nothing to
+/// point at: a Python list holds objects and a column holds numbers.
+/// What decides a column's type is its first value, which is
+/// [`buffer::Column`]'s rule and the loader's, so a dictionary and a
+/// load read the same way and refuse the same things.
+fn from_lists(dict: &Bound<'_, PyDict>) -> PyResult<Described> {
+    let built = load::build(Some(dict))?;
+    let rows = built.first().map(|(_, column)| column.len()).unwrap_or(0) as u64;
+    let mut named = Vec::with_capacity(built.len());
+    let mut owned = Vec::with_capacity(built.len());
+    for (name, column) in built {
+        let (ty, bytes) = packed(&name, column)?;
+        named.push((name, ty));
+        owned.push(bytes);
+    }
+    let held = Arc::new(Held { batch: None, owned });
+    let columns = named
+        .into_iter()
+        .zip(&held.owned)
+        .map(|((name, ty), bytes)| Column {
+            name,
+            ty,
+            layout: lent(bytes),
+        })
+        .collect();
+    Ok(Described {
+        columns,
+        rows,
+        held,
+    })
+}
+
+/// One column of Python values, as the bytes a frame reads and what
+/// they mean.
+fn packed(name: &str, column: buffer::Column) -> PyResult<(LogicalType, Bytes)> {
+    let counts = LogicalType::Int {
+        signed: true,
+        bits: IntBits::B64,
+        precision: None,
+    };
+    let characters = LogicalType::Str {
+        min: None,
+        max: None,
+        fixed: false,
+    };
+    // The temporal buffers count in `i64` and the integer one holds the
+    // bits of one in a `u64`, and both of them are the eight-byte lane
+    // the engine reads through, so this cast is the identity on the
+    // bytes and the logical type beside them is what says how to read
+    // them.
+    let same = |v: Vec<i64>| Bytes::Counts(v.into_iter().map(|n| n as u64).collect());
+    Ok(match column {
+        buffer::Column::Int(v) => (counts, Bytes::Counts(v)),
+        buffer::Column::Float(v) => (
+            LogicalType::Float {
+                bits: FloatBits::B64,
+                precision: None,
+            },
+            Bytes::Floats(v),
+        ),
+        buffer::Column::Bool(v) => {
+            // At least one byte, so the pointer is an allocation and
+            // not the dangling address an empty vector lends out. A
+            // frame of no rows never reaches a read, but it does reach
+            // the check that the pointer is not null.
+            let mut bits = vec![0u8; v.len().div_ceil(8).max(1)];
+            for (row, &yes) in v.iter().enumerate() {
+                if yes {
+                    bits[row / 8] |= 1 << (row % 8);
+                }
+            }
+            (LogicalType::Bool, Bytes::Bits(bits))
+        }
+        buffer::Column::Str(v) => {
+            let mut data = Vec::with_capacity(v.iter().map(String::len).sum::<usize>().max(1));
+            let mut offsets = Vec::with_capacity(v.len() + 1);
+            offsets.push(0i32);
+            for word in &v {
+                data.extend_from_slice(word.as_bytes());
+                let end = i32::try_from(data.len()).map_err(|_| {
+                    pyo3::exceptions::PyValueError::new_err(format!(
+                        "column '{name}' holds more than two gigabytes of characters, which is \
+                         further than the offsets of a frame reach"
+                    ))
+                })?;
+                offsets.push(end);
+            }
+            (characters, Bytes::Text { data, offsets })
+        }
+        // Refused by the loader that built the column, so this arm is
+        // here to be exhaustive rather than to be reached.
+        buffer::Column::Bytes(_) => {
+            return Err(pyo3::exceptions::PyTypeError::new_err(format!(
+                "column '{name}' holds byte strings, and no statement can read a column of bytes \
+                 back yet"
+            )));
+        }
+        buffer::Column::Date(v) => (LogicalType::Date, Bytes::Days(v)),
+        buffer::Column::LocalTime(v) => (LogicalType::LocalTime, same(v)),
+        buffer::Column::LocalDatetime(v) => (LogicalType::LocalDatetime, same(v)),
+        buffer::Column::Duration(kind, v) => (LogicalType::Duration(kind), same(v)),
+    })
+}
+
+/// Where one of this module's own buffers is, as a layout.
+fn lent(bytes: &Bytes) -> Layout {
+    match bytes {
+        Bytes::Counts(v) => Layout::Int {
+            ptr: at(v.as_ptr()),
+            bits: IntBits::B64,
+            signed: true,
+            scale: 1,
+        },
+        Bytes::Days(v) => Layout::Int {
+            ptr: at(v.as_ptr()),
+            bits: IntBits::B32,
+            signed: true,
+            scale: 1,
+        },
+        Bytes::Floats(v) => Layout::Float {
+            ptr: at(v.as_ptr()),
+            bits: FloatBits::B64,
+        },
+        Bytes::Bits(v) => Layout::Bool {
+            ptr: at(v.as_ptr()),
+        },
+        Bytes::Text { data, offsets } => Layout::Str {
+            offsets: at(offsets.as_ptr()),
+            wide: false,
+            data: at(data.as_ptr()),
+            data_len: data.len(),
+        },
+    }
+}
+
+/// A pointer to the start of something this process is holding.
+///
+/// Never null: a vector's pointer is an allocation or a dangling
+/// aligned address, and an Arrow buffer's is an allocation. Neither of
+/// them is address zero.
+fn at<T>(ptr: *const T) -> NonNull<u8> {
+    NonNull::new(ptr as *mut u8).expect("a buffer of this process is never at address zero")
+}
+
+/// Where one Arrow column is and what it means.
+///
+/// The buffers come off the array data rather than off a downcast per
+/// type, because what is wanted is the same thing every time: the run
+/// of bytes Arrow put the values in. The row offset was taken out of
+/// the array before this, so buffer zero starts at row zero.
+///
+/// The scale is what one value is multiplied by to reach the unit its
+/// meaning counts in, which is where Arrow's microseconds meet this
+/// engine's nanoseconds. Nothing is converted here: the multiplication
+/// happens per scanned chunk, on the rows a statement actually reads.
+fn described(name: &str, array: &ArrayRef) -> PyResult<(LogicalType, Layout)> {
+    let ty = array.data_type();
     let refused = |instead: &str| {
-        Err(pyo3::exceptions::PyTypeError::new_err(format!(
-            "column '{name}' is {ty}, and {instead}"
-        )))
+        pyo3::exceptions::PyTypeError::new_err(format!("column '{name}' is {ty}, and {instead}"))
+    };
+    let data = array.to_data();
+    let bufs = data.buffers();
+    let word = |bits: IntBits, signed: bool, scale: i64, means: LogicalType| {
+        (
+            means,
+            Layout::Int {
+                ptr: at(bufs[0].as_ptr()),
+                bits,
+                signed,
+                scale,
+            },
+        )
+    };
+    let plain = |signed: bool, bits: IntBits| LogicalType::Int {
+        signed,
+        bits,
+        precision: None,
+    };
+    let float = |bits: FloatBits| {
+        (
+            LogicalType::Float {
+                bits,
+                precision: None,
+            },
+            Layout::Float {
+                ptr: at(bufs[0].as_ptr()),
+                bits,
+            },
+        )
+    };
+    let characters = || LogicalType::Str {
+        min: None,
+        max: None,
+        fixed: false,
+    };
+    let text = |wide: bool| {
+        (
+            characters(),
+            Layout::Str {
+                offsets: at(bufs[0].as_ptr()),
+                wide,
+                data: at(bufs[1].as_ptr()),
+                data_len: bufs[1].len(),
+            },
+        )
     };
     Ok(match ty {
-        DataType::Boolean => Column::Bool(Vec::new()),
-        DataType::Int8
-        | DataType::Int16
-        | DataType::Int32
-        | DataType::Int64
-        | DataType::UInt8
-        | DataType::UInt16
-        | DataType::UInt32
-        | DataType::UInt64 => Column::Int(Vec::new()),
-        DataType::Float32 | DataType::Float64 => Column::Float(Vec::new()),
+        DataType::Boolean => (
+            LogicalType::Bool,
+            Layout::Bool {
+                ptr: at(bufs[0].as_ptr()),
+            },
+        ),
+        DataType::Int8 => word(IntBits::B8, true, 1, plain(true, IntBits::B8)),
+        DataType::Int16 => word(IntBits::B16, true, 1, plain(true, IntBits::B16)),
+        DataType::Int32 => word(IntBits::B32, true, 1, plain(true, IntBits::B32)),
+        DataType::Int64 => word(IntBits::B64, true, 1, plain(true, IntBits::B64)),
+        DataType::UInt8 => word(IntBits::B8, false, 1, plain(false, IntBits::B8)),
+        DataType::UInt16 => word(IntBits::B16, false, 1, plain(false, IntBits::B16)),
+        DataType::UInt32 => word(IntBits::B32, false, 1, plain(false, IntBits::B32)),
+        DataType::UInt64 => word(IntBits::B64, false, 1, plain(false, IntBits::B64)),
+        DataType::Float32 => float(FloatBits::B32),
+        DataType::Float64 => float(FloatBits::B64),
         // The three string layouts of Arrow, which are three ways of
         // holding the same characters: offsets into one buffer, wider
         // offsets into one buffer, and views into several. polars hands
-        // out the third by default and pandas the first, and a column of
-        // this table holds strings either way.
-        DataType::Utf8 | DataType::LargeUtf8 | DataType::Utf8View => Column::Str(Vec::new()),
-        DataType::Date32 => Column::Date(Vec::new()),
-        DataType::Time32(_) | DataType::Time64(_) => Column::LocalTime(Vec::new()),
-        DataType::Timestamp(_, None) => Column::LocalDatetime(Vec::new()),
+        // out the third by default and pandas the first, and a column
+        // of this table holds strings either way. A short view is
+        // already this engine's own, byte for byte.
+        DataType::Utf8 => text(false),
+        DataType::LargeUtf8 => text(true),
+        DataType::Utf8View => (
+            characters(),
+            Layout::View {
+                views: at(bufs[0].as_ptr()),
+                data: bufs[1..]
+                    .iter()
+                    .map(|buf| (at(buf.as_ptr()), buf.len()))
+                    .collect(),
+            },
+        ),
+        DataType::Date32 => word(IntBits::B32, true, 1, LogicalType::Date),
+        DataType::Time32(TimeUnit::Second) => {
+            word(IntBits::B32, true, 1_000_000_000, LogicalType::LocalTime)
+        }
+        DataType::Time32(TimeUnit::Millisecond) => {
+            word(IntBits::B32, true, 1_000_000, LogicalType::LocalTime)
+        }
+        DataType::Time64(TimeUnit::Microsecond) => {
+            word(IntBits::B64, true, 1_000, LogicalType::LocalTime)
+        }
+        DataType::Time64(TimeUnit::Nanosecond) => {
+            word(IntBits::B64, true, 1, LogicalType::LocalTime)
+        }
+        DataType::Timestamp(unit, None) => {
+            word(IntBits::B64, true, nanos(unit), LogicalType::LocalDatetime)
+        }
         DataType::Timestamp(_, Some(zone)) => {
-            return refused(&format!(
+            return Err(refused(&format!(
                 "a column of this table has nowhere to keep '{zone}', so drop the zone once the \
                  values are in the zone you want them in, or write it as a string"
-            ));
+            )));
         }
-        DataType::Duration(_) => Column::Duration(DurationKind::DayTime, Vec::new()),
-        DataType::Interval(IntervalUnit::YearMonth) => {
-            Column::Duration(DurationKind::YearMonth, Vec::new())
-        }
+        DataType::Duration(unit) => word(
+            IntBits::B64,
+            true,
+            nanos(unit),
+            LogicalType::Duration(DurationKind::DayTime),
+        ),
+        DataType::Interval(IntervalUnit::YearMonth) => word(
+            IntBits::B32,
+            true,
+            1,
+            LogicalType::Duration(DurationKind::YearMonth),
+        ),
         DataType::Dictionary(_, _) => {
-            return refused(
+            return Err(refused(
                 "a dictionary is a layout rather than a type here, so cast it to what it holds \
                  first",
-            );
+            ));
         }
         DataType::Binary | DataType::LargeBinary | DataType::BinaryView => {
-            return refused(
-                "no statement can read a column of bytes back yet, so writing one would be \
-                 writing data the caller cannot get at",
-            );
+            return Err(refused(
+                "no statement can read a column of bytes back yet, so registering one would be \
+                 naming data the caller cannot get at",
+            ));
         }
         _ => {
-            return refused(
+            return Err(refused(
                 "a column holds booleans, integers, floats, strings, dates, times, datetimes or \
                  durations",
-            );
+            ));
         }
     })
 }
 
-/// Every column of one batch, appended to the buffers it belongs in.
-///
-/// Runs with the GIL released and so cannot raise: what goes wrong
-/// comes back as a [`Snag`] and is raised by the caller.
-fn take(columns: &mut [(String, Column)], batch: &RecordBatch, base: usize) -> Result<(), Snag> {
-    for (at, (name, column)) in columns.iter_mut().enumerate() {
-        let array = batch.column(at);
-        if array.null_count() > 0 {
-            let row = (0..array.len())
-                .find(|&row| array.is_null(row))
-                .unwrap_or(0);
-            return Err(Snag::Value(format!(
-                "column '{name}' has no value at row {}, and every column of a row holds one",
-                base + row
-            )));
-        }
-        one(name, column, array, base)?;
+/// How many nanoseconds one count of this unit is, which is the scale a
+/// temporal column is read through.
+fn nanos(unit: &TimeUnit) -> i64 {
+    match unit {
+        TimeUnit::Second => 1_000_000_000,
+        TimeUnit::Millisecond => 1_000_000,
+        TimeUnit::Microsecond => 1_000,
+        TimeUnit::Nanosecond => 1,
     }
-    Ok(())
-}
-
-/// Every value of a primitive array, converted and pushed.
-///
-/// A macro rather than a function because the conversion differs per
-/// arm in both directions: a `Time32` in seconds and an `Int32` are
-/// the same bits and not the same value, and an integer column keeps
-/// its bits where a temporal one keeps a count. Twenty arms of the same
-/// three lines is what this saves.
-macro_rules! pushed {
-    ($array:expr, $ty:ty, $out:expr, $changed:expr, $convert:expr) => {{
-        let values = $array
-            .as_any()
-            .downcast_ref::<PrimitiveArray<$ty>>()
-            .ok_or_else($changed)?;
-        $out.extend(values.values().iter().copied().map($convert));
-    }};
-}
-
-/// One column of one batch.
-///
-/// The pair is matched rather than the array alone, so a stream that
-/// changed a column's type between batches is caught here instead of
-/// filling one buffer with values of two kinds. It cannot happen
-/// through a producer that keeps to its own schema, which is why the
-/// arm says so rather than explaining itself.
-fn one(name: &str, column: &mut Column, array: &ArrayRef, base: usize) -> Result<(), Snag> {
-    let changed = || {
-        Snag::Type(format!(
-            "column '{name}' arrived as {} in a later batch than the one that declared it, which \
-             is a producer that broke its own schema",
-            array.data_type()
-        ))
-    };
-    match (array.data_type(), column) {
-        (DataType::Boolean, Column::Bool(out)) => {
-            let values = array
-                .as_any()
-                .downcast_ref::<BooleanArray>()
-                .ok_or_else(changed)?;
-            out.extend(values.values().iter());
-        }
-        (DataType::Int8, Column::Int(out)) => {
-            pushed!(array, Int8Type, out, changed, |n| n as i64 as u64)
-        }
-        (DataType::Int16, Column::Int(out)) => {
-            pushed!(array, Int16Type, out, changed, |n| n as i64 as u64)
-        }
-        (DataType::Int32, Column::Int(out)) => {
-            pushed!(array, Int32Type, out, changed, |n| n as i64 as u64)
-        }
-        (DataType::Int64, Column::Int(out)) => {
-            pushed!(array, Int64Type, out, changed, |n| n as u64)
-        }
-        (DataType::UInt8, Column::Int(out)) => {
-            pushed!(array, UInt8Type, out, changed, u64::from)
-        }
-        (DataType::UInt16, Column::Int(out)) => {
-            pushed!(array, UInt16Type, out, changed, u64::from)
-        }
-        (DataType::UInt32, Column::Int(out)) => {
-            pushed!(array, UInt32Type, out, changed, u64::from)
-        }
-        (DataType::UInt64, Column::Int(out)) => {
-            // The one integer width that does not fit. A value above
-            // what an INT64 holds is refused where it sits rather than
-            // written as a negative number, which is the kind of thing
-            // a caller finds out about a year later.
-            let values = array
-                .as_any()
-                .downcast_ref::<PrimitiveArray<UInt64Type>>()
-                .ok_or_else(changed)?;
-            for (row, &value) in values.values().iter().enumerate() {
-                if value > i64::MAX as u64 {
-                    return Err(Snag::Value(format!(
-                        "column '{name}' holds {value} at row {}, which is larger than the largest \
-                         integer a column of a table holds",
-                        base + row
-                    )));
-                }
-                out.push(value);
-            }
-        }
-        (DataType::Float32, Column::Float(out)) => {
-            pushed!(array, Float32Type, out, changed, f64::from)
-        }
-        (DataType::Float64, Column::Float(out)) => {
-            pushed!(array, Float64Type, out, changed, |f| f)
-        }
-        (DataType::Utf8, Column::Str(out)) => {
-            let values = array
-                .as_any()
-                .downcast_ref::<StringArray>()
-                .ok_or_else(changed)?;
-            out.extend(values.iter().map(|s| s.unwrap_or_default().to_string()));
-        }
-        (DataType::LargeUtf8, Column::Str(out)) => {
-            let values = array
-                .as_any()
-                .downcast_ref::<LargeStringArray>()
-                .ok_or_else(changed)?;
-            out.extend(values.iter().map(|s| s.unwrap_or_default().to_string()));
-        }
-        (DataType::Utf8View, Column::Str(out)) => {
-            let values = array
-                .as_any()
-                .downcast_ref::<StringViewArray>()
-                .ok_or_else(changed)?;
-            out.extend(values.iter().map(|s| s.unwrap_or_default().to_string()));
-        }
-        (DataType::Date32, Column::Date(out)) => {
-            pushed!(array, Date32Type, out, changed, |days| days)
-        }
-        (DataType::Time32(TimeUnit::Second), Column::LocalTime(out)) => {
-            pushed!(array, Time32SecondType, out, changed, |n| i64::from(n)
-                * 1_000_000_000)
-        }
-        (DataType::Time32(TimeUnit::Millisecond), Column::LocalTime(out)) => {
-            pushed!(array, Time32MillisecondType, out, changed, |n| i64::from(n)
-                * 1_000_000)
-        }
-        (DataType::Time64(TimeUnit::Microsecond), Column::LocalTime(out)) => {
-            pushed!(array, Time64MicrosecondType, out, changed, |n| n * 1_000)
-        }
-        (DataType::Time64(TimeUnit::Nanosecond), Column::LocalTime(out)) => {
-            pushed!(array, Time64NanosecondType, out, changed, |n| n)
-        }
-        (DataType::Timestamp(TimeUnit::Second, None), Column::LocalDatetime(out)) => {
-            pushed!(array, TimestampSecondType, out, changed, |n| n
-                * 1_000_000_000)
-        }
-        (DataType::Timestamp(TimeUnit::Millisecond, None), Column::LocalDatetime(out)) => {
-            pushed!(array, TimestampMillisecondType, out, changed, |n| n
-                * 1_000_000)
-        }
-        (DataType::Timestamp(TimeUnit::Microsecond, None), Column::LocalDatetime(out)) => {
-            pushed!(array, TimestampMicrosecondType, out, changed, |n| n * 1_000)
-        }
-        (DataType::Timestamp(TimeUnit::Nanosecond, None), Column::LocalDatetime(out)) => {
-            pushed!(array, TimestampNanosecondType, out, changed, |n| n)
-        }
-        (DataType::Duration(TimeUnit::Second), Column::Duration(DurationKind::DayTime, out)) => {
-            pushed!(array, DurationSecondType, out, changed, |n| n
-                * 1_000_000_000)
-        }
-        (
-            DataType::Duration(TimeUnit::Millisecond),
-            Column::Duration(DurationKind::DayTime, out),
-        ) => {
-            pushed!(array, DurationMillisecondType, out, changed, |n| n
-                * 1_000_000)
-        }
-        (
-            DataType::Duration(TimeUnit::Microsecond),
-            Column::Duration(DurationKind::DayTime, out),
-        ) => {
-            pushed!(array, DurationMicrosecondType, out, changed, |n| n * 1_000)
-        }
-        (
-            DataType::Duration(TimeUnit::Nanosecond),
-            Column::Duration(DurationKind::DayTime, out),
-        ) => {
-            pushed!(array, DurationNanosecondType, out, changed, |n| n)
-        }
-        (
-            DataType::Interval(IntervalUnit::YearMonth),
-            Column::Duration(DurationKind::YearMonth, out),
-        ) => {
-            pushed!(array, IntervalYearMonthType, out, changed, i64::from)
-        }
-        _ => return Err(changed()),
-    }
-    Ok(())
 }

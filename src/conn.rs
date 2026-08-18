@@ -7,7 +7,6 @@
 //! to run statements at once want two connections. It is there so that
 //! a program which shares one by accident waits rather than corrupts.
 
-use std::collections::BTreeMap;
 use std::ffi::CStr;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -68,18 +67,6 @@ pub struct Connection {
     /// asking it to stop, should not queue behind a ten second
     /// statement.
     alive: AtomicBool,
-    /// The names this connection has registered frames under, against
-    /// whether one is registered under them now. A name that was
-    /// unregistered stays here as `false`, because the empty table it
-    /// left behind is still a table this connection made and is still
-    /// the one a later `register` under the same name may fill: forget
-    /// it entirely and the name would be refused as somebody else's.
-    ///
-    /// Kept per connection rather than per database, because a
-    /// registered frame is a caller's data under a caller's name and
-    /// another program opening the same file has no idea it is anything
-    /// but a table.
-    frames: Mutex<BTreeMap<String, bool>>,
     #[pyo3(get)]
     path: PathBuf,
     #[pyo3(get)]
@@ -196,48 +183,38 @@ impl Connection {
     ///
     /// Anything that speaks Arrow goes in: a pandas or polars
     /// DataFrame, a pyarrow Table or RecordBatchReader, or a dictionary
-    /// of lists. The frame is copied into the database rather than
-    /// scanned where it sits, because the engine has no way yet to call
-    /// back out to a Python object mid statement, so what a program
-    /// registers is a snapshot: changing the DataFrame afterwards
-    /// changes nothing here until it is registered again.
+    /// of lists. Nothing is copied. The engine is told where the
+    /// columns are and reads them where they lie, so registering costs
+    /// the same whether the frame has ten rows or ten million, and a
+    /// frame is a view rather than a snapshot: write into the array
+    /// behind it and the next statement answers what is there now. A
+    /// dictionary of Python lists is the one exception, since a list
+    /// holds objects rather than numbers and there is nothing in it to
+    /// point at.
     ///
-    /// Registering the same name again replaces the rows under it.
-    /// Registering over a table this connection did not register is
-    /// refused, since a frame knows nothing about the rows that were
-    /// already there. Gives back the number of rows written.
-    fn register(
-        slf: Py<Self>,
-        py: Python<'_>,
-        name: &str,
-        data: &Bound<'_, PyAny>,
-    ) -> PyResult<usize> {
-        register::register(py, slf, name, data)
+    /// The frame belongs to this connection and goes when it does.
+    /// Nothing is written to the database and no other program sees it.
+    /// Registering the same name again replaces what it stands for,
+    /// columns and all. Registering over a table the database already
+    /// holds is refused, since a statement naming it would mean the
+    /// stored one. Gives back the number of rows the frame has.
+    fn register(&self, py: Python<'_>, name: &str, data: &Bound<'_, PyAny>) -> PyResult<usize> {
+        register::register(py, self, name, data)
     }
 
-    /// Takes the rows of a registered frame back out.
+    /// Takes a registered frame's name away.
     ///
-    /// The name stops being a frame of this connection's and the rows
-    /// go. The empty table stays in the catalog, because no statement
-    /// of this engine drops one yet, so the name cannot afterwards be
-    /// used for something that is not a table.
+    /// The name stops standing for anything and the bytes go back to
+    /// the caller, which is not necessarily this instant: a statement
+    /// still reading the frame holds it until it ends.
     fn unregister(&self, py: Python<'_>, name: &str) -> PyResult<()> {
         register::unregister(py, self, name)
     }
 
     /// The names this connection has registered frames under, sorted.
     #[getter]
-    fn registered(&self) -> Vec<String> {
-        self.frames
-            .lock()
-            .map(|frames| {
-                frames
-                    .iter()
-                    .filter(|&(_, &registered)| registered)
-                    .map(|(name, _)| name.clone())
-                    .collect()
-            })
-            .unwrap_or_default()
+    fn registered(&self, py: Python<'_>) -> PyResult<Vec<String>> {
+        register::registered(py, self)
     }
 
     /// Asks the statement running on this connection to stop.
@@ -361,7 +338,6 @@ impl Connection {
             inner: Arc::new(Mutex::new(Some(opened))),
             runner: OnceLock::new(),
             alive: AtomicBool::new(true),
-            frames: Mutex::new(BTreeMap::new()),
             path,
             read_only,
         })
@@ -447,35 +423,6 @@ impl Connection {
             Ok(work(conn))
         })
         .map_err(|()| closed(py, "this connection"))
-    }
-
-    /// Whether a frame is registered here under this name right now.
-    pub(crate) fn registered_here(&self, name: &str) -> bool {
-        self.frames
-            .lock()
-            .is_ok_and(|frames| frames.get(name) == Some(&true))
-    }
-
-    /// Whether this connection made the table of this name, whether or
-    /// not a frame is registered under it now.
-    pub(crate) fn made_here(&self, name: &str) -> bool {
-        self.frames
-            .lock()
-            .is_ok_and(|frames| frames.contains_key(name))
-    }
-
-    pub(crate) fn remember(&self, name: &str) {
-        if let Ok(mut frames) = self.frames.lock() {
-            frames.insert(name.to_string(), true);
-        }
-    }
-
-    pub(crate) fn forget(&self, name: &str) {
-        if let Ok(mut frames) = self.frames.lock()
-            && let Some(registered) = frames.get_mut(name)
-        {
-            *registered = false;
-        }
     }
 }
 

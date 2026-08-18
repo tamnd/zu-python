@@ -90,7 +90,7 @@ class Connection:
         """Puts a DataFrame under a name a statement can match on."""
 
     def unregister(self, name: str) -> None:
-        """Takes the rows of a registered frame back out."""
+        """Takes a registered frame's name away."""
 
     @property
     def registered(self) -> list[str]:
