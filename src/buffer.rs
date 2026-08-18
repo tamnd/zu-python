@@ -21,7 +21,6 @@ use pyo3::types::{PyBool, PyBytes, PyDate, PyDateTime, PyDelta, PyTime};
 use zu_common::temporal::days_from_civil;
 use zu_common::{DurationKind, FloatBits, IntBits, LogicalType, Temporal};
 use zudb::Field;
-use zudb::query::Value;
 
 use crate::value::{Duration, clock_nanos};
 
@@ -284,27 +283,6 @@ impl Column {
             Column::LocalTime(v) | Column::LocalDatetime(v) => v.clear(),
             Column::Duration(_, v) => v.clear(),
         }
-    }
-
-    /// One value of this column as a statement's parameter takes it.
-    ///
-    /// Owned rather than borrowed, unlike `field`, because a parameter
-    /// is bound for the length of a statement and the statement is
-    /// where the copy was always going to happen. `None` for a column
-    /// of byte strings, which no statement carries a literal or a
-    /// parameter for.
-    pub fn value(&self, row: usize) -> Option<Value> {
-        Some(match self {
-            Column::Int(v) => Value::Int(v[row] as i64),
-            Column::Float(v) => Value::Float(v[row]),
-            Column::Bool(v) => Value::Bool(v[row]),
-            Column::Str(v) => Value::Str(v[row].clone()),
-            Column::Bytes(_) => return None,
-            Column::Date(v) => Value::Temporal(Temporal::Date(v[row])),
-            Column::LocalTime(v) => Value::Temporal(Temporal::LocalTime(v[row])),
-            Column::LocalDatetime(v) => Value::Temporal(Temporal::LocalDatetime(v[row])),
-            Column::Duration(kind, v) => Value::Temporal(Temporal::Duration(*kind, v[row])),
-        })
     }
 
     /// One value of this column as the engine's appender takes it.
