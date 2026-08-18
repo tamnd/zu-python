@@ -88,7 +88,9 @@ Three per platform, which is more than it sounds like it should be and is not op
 | `cp314-cp314t` | free-threaded 3.14 |
 | `cp315-abi3t` | 3.15 and every later 3.x, both builds |
 
-Platforms: manylinux_2_28 and musllinux on x86_64 and aarch64, macOS universal2, Windows x64 and arm64. An `sdist` that builds with only a Rust toolchain is published too, and is tested in CI on a clean container.
+Platforms: manylinux_2_28 and musllinux on x86_64 and aarch64, macOS universal2, Windows x64 and arm64. An `sdist` that builds with only a Rust toolchain is published too, and is built back into a wheel in CI.
+
+That is twenty-one wheels and the release checks all twenty-one, twice. Each build is held to the tag it asked for, and then the grid is checked as a grid: every cell filled and nothing outside it. A build that cannot find the interpreter it wants does not fail, it falls back and produces a version-specific wheel that works on the machine that built it and claims nothing about any other version, which is the kind of thing nobody notices until somebody's install resolves to it.
 
 Optional extras, none required: `zudb[pandas]`, `[polars]`, `[arrow]`, `[viz]`, `[all]`. The base wheel depends on nothing.
 

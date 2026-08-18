@@ -27,6 +27,16 @@ jobs:
       # every machine, so nothing installs one.
       - run: cargo fmt --all --check
       - run: cargo clippy --all-targets -- -D warnings
+      # The other two ABIs the release builds, each a feature of this
+      # crate, compiled here so that a change which breaks one is found
+      # on the pull request rather than on the tag. The free-threaded
+      # stable ABI needs no interpreter at all, which is the point of a
+      # stable ABI and the only reason 3.15 can be built for before it
+      # is installable.
+      - run: cargo check --no-default-features --features pyo3/extension-module
+      - run: cargo check --no-default-features --features abi3t,pyo3/extension-module
+        env:
+          PYO3_NO_PYTHON: 1
 
   test:
     strategy:

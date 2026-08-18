@@ -64,6 +64,9 @@ strip = true
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 addopts = "-q"
+# `tools` holds the checks the release job runs, which are tested here
+# rather than only on the tag that would fail because of one.
+pythonpath = ["tools"]
 
 [tool.ruff]
 target-version = "py311"
