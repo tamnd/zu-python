@@ -35,6 +35,7 @@ from .errors import (
     SyntaxError,
     TransactionError,
 )
+from .types import Value
 
 __version__ = "0.0.1"
 
@@ -47,6 +48,7 @@ __all__ = [
     "Rel",
     "Path",
     "Duration",
+    "Value",
     "Error",
     "ConnectionError",
     "DataError",

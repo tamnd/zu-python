@@ -46,5 +46,8 @@ jobs:
       # gets: the extension out of a wheel, the package out of
       # site-packages, and nothing resolved out of the checkout.
       - run: pip install ".[all]"
-      - run: pip install pytest
+      # griffe reads the stub and inspects the installed extension, so
+      # the check runs against the wheel rather than against the
+      # checkout it was built from.
+      - run: pip install pytest griffe
       - run: pytest
