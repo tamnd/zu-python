@@ -48,6 +48,7 @@ def after(delay: float, do) -> threading.Thread:
     return thread
 
 
+@pytest.mark.timing
 def test_a_press_raises_keyboard_interrupt_within_the_budget(throng: zudb.Connection) -> None:
     pressed: list[float] = []
 
@@ -76,6 +77,7 @@ def test_the_connection_is_the_same_afterwards(throng: zudb.Connection) -> None:
     assert throng.execute("MATCH (p:person) RETURN count(p) AS n").fetchone() == (12_000,)
 
 
+@pytest.mark.timing
 def test_interrupt_stops_a_statement_from_another_thread(throng: zudb.Connection) -> None:
     asked: list[float] = []
 
@@ -137,6 +139,7 @@ def test_interrupt_on_a_closed_connection_says_so(social: zudb.Connection) -> No
         social.interrupt()
 
 
+@pytest.mark.timing
 def test_a_connection_answers_while_it_is_busy(throng: zudb.Connection) -> None:
     """Asking a connection how it is going does not queue behind the
     statement it is going through."""
@@ -165,6 +168,7 @@ def test_rows_read_holds_what_the_last_statement_cost(social: zudb.Connection) -
     assert social.rows_read >= 3
 
 
+@pytest.mark.timing
 def test_a_statement_that_finishes_is_not_slowed_by_being_watched(social: zudb.Connection) -> None:
     """The thread a statement runs on is kept rather than made, so a
     small statement on the main thread costs about what it costs on any

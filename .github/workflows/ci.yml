@@ -62,6 +62,105 @@ jobs:
       - run: pip install pytest griffe ipython
       - run: pytest
 
+  # The same suite again, over an extension built with AddressSanitizer.
+  #
+  # There is no `unsafe` in this crate, which is the reason to run this
+  # rather than the reason not to: what a binding gets wrong is not
+  # arithmetic on a raw pointer but a buffer read after the object that
+  # owned it was collected, or an engine allocation freed on one side of
+  # the boundary and touched from the other. Neither is an `unsafe`
+  # block here and both are a use-after-free.
+  #
+  # ASan's runtime has to be loaded before anything it instruments, and
+  # the extension is opened by `import` long after python has started,
+  # so it is preloaded rather than linked: `-Zexternal-clangrt` tells
+  # rustc not to bundle its own copy and LD_PRELOAD supplies clang's.
+  # `--target` is what keeps the flags off the build scripts, which are
+  # host programs with no runtime preloaded and would not link.
+  # Leak detection is off, because LSan reports the interpreter's own
+  # hundred one-time allocations and cannot be told to stop; the job
+  # below is where leaks are counted, with a tool that can.
+  sanitizer:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.14"
+      - uses: Swatinem/rust-cache@v2
+      # The instrumented build is nightly, because `-Zsanitizer` is, and
+      # it is the only thing here that is: what ships is built by the
+      # pinned compiler in every other job.
+      - run: rustup toolchain install nightly --profile minimal
+      - run: sudo apt-get update && sudo apt-get install -y libclang-rt-18-dev
+      - run: pip install maturin pytest ipython
+      - name: The extension, instrumented
+        env:
+          RUSTUP_TOOLCHAIN: nightly
+          RUSTFLAGS: -Zsanitizer=address -Zexternal-clangrt
+          CC: clang
+          CXX: clang++
+        run: |
+          maturin build --target x86_64-unknown-linux-gnu --out dist
+          pip install --force-reinstall --no-deps dist/*.whl
+      - name: The suite, watched
+        run: |
+          runtime=$(clang -print-file-name=libclang_rt.asan-$(uname -m).so)
+          test -f "$runtime"
+          LD_PRELOAD="$runtime" ASAN_OPTIONS=detect_leaks=0:abort_on_error=1 \
+            pytest -m "not timing"
+
+  # The third tool over the same suite, and the one that watches what
+  # the sanitizer cannot. ASan instruments the source it compiles, so it
+  # sees nothing the interpreter does with the memory it hands the
+  # extension; Valgrind instruments the instructions that run, so both
+  # sides of the boundary are watched and so is every prebuilt thing
+  # either of them links. It also reports a read of memory nobody wrote,
+  # which ASan does not look for at all.
+  #
+  # PYTHONMALLOC=malloc is what makes this readable. CPython pools small
+  # objects behind its own allocator by default, so every allocation
+  # this extension makes through the interpreter would arrive as one
+  # 256KB arena and nothing inside it could be attributed to anybody.
+  #
+  # tools/valgrind.supp is one rule and says what it leaves out. The
+  # gate is validated the only way a gate can be: a deliberate leak
+  # through ctypes fails it.
+  leaks:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.14"
+      - uses: Swatinem/rust-cache@v2
+      - run: sudo apt-get update && sudo apt-get install -y valgrind
+      # An ordinary build. Valgrind wants the instructions the extension
+      # actually ships, and an instrumented one would be a different
+      # program with a different allocator underneath it.
+      # Every optional dependency except polars, which starts a thread
+      # pool the moment it is imported and holds a block of thread-local
+      # state per worker for the life of the process. Valgrind reports
+      # all of it and none of it belongs to this client, and the one
+      # test that wants polars skips itself when it is missing. Pandas
+      # and pyarrow stay because the README examples this suite runs go
+      # through them.
+      - run: pip install ".[pandas]" pytest ipython
+      - name: A leak the job is meant to catch, caught
+        run: |
+          set +e
+          PYTHONMALLOC=malloc valgrind --error-exitcode=1 --leak-check=full \
+            --errors-for-leak-kinds=definite,possible \
+            --suppressions=tools/valgrind.supp -q \
+            python -c 'import ctypes; ctypes.CDLL("libc.so.6").malloc(4096)'
+          test $? -eq 1 || { echo "the leak gate did not fire on a leak"; exit 1; }
+      - name: The suite, counted
+        run: |
+          PYTHONMALLOC=malloc valgrind --error-exitcode=1 --leak-check=full \
+            --errors-for-leak-kinds=definite,possible \
+            --suppressions=tools/valgrind.supp -q \
+            python -m pytest -m "not timing"
+
   # The shared corpus, which is the same 945 cases the engine runs
   # against itself and the eight other clients run against theirs. It is
   # a job of its own because it needs a second checkout, and it runs on

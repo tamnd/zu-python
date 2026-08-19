@@ -1,0 +1,49 @@
+# What the leak job does not count, and why.
+#
+# CPython leaks on purpose. Interned strings, the import machinery's
+# tables and a few hundred one-time allocations are never freed, because
+# an interpreter that is about to exit has nothing to gain by walking
+# them, and the run below reports about eighty of them on a suite that
+# does nothing at all. None of that is this client's memory and none of
+# it is a bug anybody here can fix.
+#
+# So there is one rule here, written out once per allocator because
+# valgrind matches a function name and C has three of them. It is narrow
+# on purpose. A leak is ignored only when the frame that allocated it is
+# inside the interpreter binary itself. Memory allocated by this
+# extension has _zudb in that frame instead and is reported, which is
+# what the job is for. A suppression file of the usual shape, a list
+# that grows a line
+# every time somebody wants the build green, would suppress the thing
+# being looked for on the first bad week; this one cannot, because it
+# names the allocator rather than the symptom.
+#
+# The gap it leaves, said out loud: a Python object this extension leaks
+# was allocated by the interpreter on its behalf, so it lands under this
+# rule. That leak is the one the suite catches from the other side,
+# where it counts live zudb.Connection objects after a collection and
+# counts the process descriptors before and after a thousand cycles.
+
+{
+   the interpreter allocating for itself, malloc
+   Memcheck:Leak
+   match-leak-kinds: definite,possible
+   fun:malloc
+   obj:*/python3*
+}
+
+{
+   the interpreter allocating for itself, realloc
+   Memcheck:Leak
+   match-leak-kinds: definite,possible
+   fun:realloc
+   obj:*/python3*
+}
+
+{
+   the interpreter allocating for itself, calloc
+   Memcheck:Leak
+   match-leak-kinds: definite,possible
+   fun:calloc
+   obj:*/python3*
+}

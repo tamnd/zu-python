@@ -432,6 +432,7 @@ def test_python_keeps_running_while_a_flush_does(graph: zudb.Connection) -> None
 COMPARED = 200
 
 
+@pytest.mark.timing
 def test_appending_beats_inserting_by_the_margin_that_makes_it_worth_having(
     tmp_path: Path,
 ) -> None:

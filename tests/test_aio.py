@@ -125,6 +125,7 @@ async def test_the_loop_runs_while_a_statement_does(tmp_path: Path) -> None:
 
 
 @run
+@pytest.mark.timing
 async def test_two_connections_run_at_the_same_time(tmp_path: Path) -> None:
     """A thread each, and the engine puts the GIL down for the work, so
     two statements together cost about what one costs rather than two.
@@ -174,6 +175,7 @@ async def test_cancelling_the_task_stops_the_statement(tmp_path: Path) -> None:
 
 
 @run
+@pytest.mark.timing
 async def test_a_cancelled_statement_leaves_the_connection_free(tmp_path: Path) -> None:
     """The reason the cancellation waits for the statement it stopped.
 
