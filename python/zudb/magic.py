@@ -39,6 +39,7 @@ it.
 
 from __future__ import annotations
 
+import os
 import shlex
 from pathlib import Path
 from typing import Any
@@ -49,6 +50,31 @@ from IPython.core.magic import Magics, cell_magic, line_magic, magics_class
 from ._zudb import Connection, connect
 
 __all__ = ["ZuMagics", "load_ipython_extension"]
+
+
+def words(line: str) -> list[str]:
+    r"""A magic's line, split the way the shell of this machine splits.
+
+    `shlex.split` is the obvious thing to call and it is wrong on
+    Windows, where a backslash is a path separator rather than an
+    escape. `%gql C:\data\social.zu1` comes back out of it as
+    `C:datasocial.zu1`, and the message a person then reads is that
+    the system cannot find a file they can see in the directory
+    listing in front of them.
+
+    So the escape character is the platform's. Quoting is not: a path
+    with a space in it is quoted the same way everywhere, because that
+    is what a person typing into a notebook cell will have done. The
+    comment character is turned off for the same reason `shlex.split`
+    turns it off, which is that `#` is a legal character in a file name
+    and a line magic is not a script.
+    """
+    lexer = shlex.shlex(line, posix=True)
+    lexer.whitespace_split = True
+    lexer.commenters = ""
+    if os.name == "nt":
+        lexer.escape = ""
+    return list(lexer)
 
 
 @magics_class
@@ -71,11 +97,11 @@ class ZuMagics(Magics):
         The connection comes back so that a cell can keep it, and it is
         closed at the end of the session like any other.
         """
-        words = shlex.split(line)
-        read_only = "--read-only" in words
-        closing = "--close" in words
-        paths = [word for word in words if not word.startswith("-")]
-        unknown = [word for word in words if word.startswith("-")]
+        given = words(line)
+        read_only = "--read-only" in given
+        closing = "--close" in given
+        paths = [word for word in given if not word.startswith("-")]
+        unknown = [word for word in given if word.startswith("-")]
         for word in unknown:
             if word not in ("--read-only", "--close"):
                 raise UsageError(f"%gql does not take {word}")
@@ -120,16 +146,16 @@ class ZuMagics(Magics):
 
     def options(self, line: str) -> dict[str, str]:
         """`--conn`, `--params` and `--out`, each naming a variable."""
-        words = shlex.split(line)
+        given = words(line)
         taken: dict[str, str] = {}
-        while words:
-            word = words.pop(0)
+        while given:
+            word = given.pop(0)
             name = word.removeprefix("--")
             if name == word or name not in ("conn", "params", "out"):
                 raise UsageError(f"%%gql takes --conn, --params and --out, and not {word}")
-            if not words:
+            if not given:
                 raise UsageError(f"--{name} names a variable, and this named none")
-            taken[name] = words.pop(0)
+            taken[name] = given.pop(0)
         return taken
 
     def namespace(self) -> dict[str, Any]:
