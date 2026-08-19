@@ -138,7 +138,10 @@ impl Connection {
     /// holding a thousand. A reader that stops early stops the scan,
     /// which is the other half of it, and `batch_rows` says how many
     /// rows a batch may hold when the rows are going somewhere with a
-    /// size of its own.
+    /// size of its own. It is a ceiling rather than a size: the engine
+    /// fills whole vectors and a batch holds as many of them as fit
+    /// under the number, so a round figure comes back a little short
+    /// unless a vector divides by it.
     ///
     /// The stream holds the connection until it ends, because a
     /// connection runs one statement at a time. Read it to the end,

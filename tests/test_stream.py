@@ -142,6 +142,21 @@ def test_the_batches_are_the_size_that_was_asked_for(many: zudb.Connection) -> N
     assert sizes[0] == 500
 
 
+def test_the_size_asked_for_is_a_ceiling_rather_than_a_size(many: zudb.Connection) -> None:
+    """The engine fills whole vectors and a batch holds as many of them
+    as fit under the number, so a round figure comes back a little short
+    unless a vector divides by it. Written down because a caller who
+    asked for three thousand and counted 2,048 would otherwise think
+    something was wrong.
+    """
+    with many.stream("MATCH (p:person) RETURN p.uid AS uid", batch_rows=3_000) as stream:
+        sizes = [len(batch) for batch in stream.batches()]
+
+    assert sum(sizes) == MANY
+    assert max(sizes) < 3_000
+    assert len(set(sizes[:-1])) == 1
+
+
 def test_a_batch_is_a_list_of_the_rows_the_loop_would_have_given(social: zudb.Connection) -> None:
     with social.stream("MATCH (p:person) RETURN p.uid AS uid") as stream:
         batches = list(stream.batches())
