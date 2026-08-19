@@ -85,6 +85,15 @@ class Connection:
     def profile(self, statement: str, params: Mapping[str, Value] | None = None) -> Profile:
         """Runs the statement with the counters on and answers what its operators really did."""
 
+    def stream(
+        self,
+        statement: str,
+        params: Mapping[str, Value] | None = None,
+        *,
+        batch_rows: int | None = None,
+    ) -> Stream:
+        """Runs one statement and hands back its rows as the engine makes them."""
+
     def transaction(self, *, read_only: bool = False) -> Transaction:
         """Starts a transaction and hands it back for a `with` block."""
 
@@ -197,6 +206,65 @@ class Prepared:
 
     def __enter__(self) -> Prepared: ...
     def __exit__(self, *_exception: object) -> bool: ...
+    def __repr__(self) -> str: ...
+
+class Stream:
+    """Rows arriving one batch at a time, while the statement is still running."""
+
+    @property
+    def columns(self) -> list[str]:
+        """The column names, in the order the statement projects them."""
+
+    @property
+    def summary(self) -> StreamSummary | None:
+        """What the statement did, once it has done it, and `None` while it is still running."""
+
+    def batches(self) -> StreamBatches:
+        """The rows in the batches they arrived in, as lists of tuples."""
+
+    def close(self) -> None:
+        """Stops the statement and gives the connection back."""
+
+    @property
+    def closed(self) -> bool:
+        """Whether the statement is over, by running out of rows or by being closed."""
+
+    def __iter__(self) -> Iterator[tuple[Value, ...]]: ...
+    def __next__(self) -> tuple[Value, ...]: ...
+    def __enter__(self) -> Stream: ...
+    def __exit__(self, *_exception: object) -> bool: ...
+    def __repr__(self) -> str: ...
+
+class StreamBatches:
+    """The same rows, in the batches they arrived in."""
+
+    def __iter__(self) -> Iterator[list[tuple[Value, ...]]]: ...
+    def __next__(self) -> list[tuple[Value, ...]]: ...
+    def __repr__(self) -> str: ...
+
+class StreamSummary:
+    """What a streamed statement did, known once it has ended."""
+
+    @property
+    def columns(self) -> list[str]:
+        """The column names, in the order the statement projected them."""
+
+    @property
+    def rows(self) -> int:
+        """How many rows were handed over."""
+
+    @property
+    def stopped(self) -> bool:
+        """Whether the reader stopped it before it ran out of rows."""
+
+    @property
+    def streamed(self) -> bool:
+        """Whether the rows arrived as they were made."""
+
+    @property
+    def notices(self) -> list[dict[str, str]]:
+        """The warnings the statement raised, in the shape a result reports them."""
+
     def __repr__(self) -> str: ...
 
 class PlanNode:

@@ -30,7 +30,7 @@ const MICROS_PER_DAY: i64 = 86_400 * 1_000_000;
 /// statement runs and carried with the rows. A catalog holds tens of
 /// tables, so this is a copy of a few short strings and not a
 /// structure worth sharing.
-#[derive(Default)]
+#[derive(Default, Clone)]
 pub struct Names {
     nodes: HashMap<u32, String>,
     rels: HashMap<u32, String>,

@@ -126,6 +126,37 @@ result.record_batches()  # a reader, for a result larger than memory
 
 `Result` implements `__arrow_c_stream__`, so anything that reads the protocol reads a result directly and none of the four methods above is needed: `pyarrow.table(result)` and `polars.DataFrame(result)` both work. Batches are 65,536 rows. A column holds one type, which the values decide, and integers beside floats are the one mixture that widens rather than being refused. Nodes, rels and paths go across as structs. The copy runs with the GIL released, and on this machine 300,000 rows across three columns take 44 ms as Arrow against 67 ms as Python objects, and a single integer column takes 13.8 ms against 44.5 ms.
 
+## Reading a result as it arrives
+
+`execute` runs the statement to the end and hands back every row. `stream` hands back the rows as the engine makes them, which is what you want when the result is bigger than the memory you meant to spend on it, or when the first rows are worth having before the last are made.
+
+```python
+with conn.stream("MATCH (p:person) RETURN p.uid AS uid, p.name AS name") as rows:
+    for uid, name in rows:
+        write(uid, name)
+```
+
+```python
+with conn.stream("MATCH (p:person) RETURN p.uid AS uid", batch_rows=10_000) as rows:
+    for batch in rows.batches():
+        write_many(batch)
+    rows.summary.rows  # how many were read
+```
+
+The statement runs on a thread of its own with the GIL down and hands each batch over a queue two batches deep, so the engine is filling the next batch while your loop is reading this one and neither waits for the other for long. On this machine, over a million people in two columns, the first row arrives 0.7 ms after the call against 30 ms for `execute`, and reading all of them takes 214 ms streamed against 256 ms in one piece, which is 4.7 million rows a second against 3.9 million. Reading them a batch at a time takes 176 ms, or 5.7 million a second, because a batch is one call where a row is one call. Streaming being the faster of the two is not a trick: the rows are made and consumed while the cache still has them, and nothing has to hold a million tuples at once. Held is the whole difference: the Python side of `fetchall` peaks at 153 MB for that result and the same read streamed peaks at nothing worth measuring, since every tuple is freed as the loop moves past it.
+
+A stream holds the connection until it ends, because a connection runs one statement at a time. Reading it to the end frees the connection, so does `close`, and so does the end of a `with` block however it was left. A statement run on the connection while a stream is open is refused with a message that says so rather than queued behind a loop that may never finish, which is the deadlock the refusal exists to prevent. If a program needs to read a stream and run statements at the same time, that is two connections.
+
+`summary` is `None` while the statement runs and afterwards says what it did: the columns, how many rows were handed over, whether the reader stopped it early, and whether the rows arrived as they were made. That last one is worth reading. A statement that has to see every row before it can give one, which is `ORDER BY`, `DISTINCT` and the aggregates, is run whole by the engine and handed over in batches afterwards, and `streamed` is `False` for it. The loop over it is the same loop and what differs is what it cost.
+
+`zudb.aio` has the same thing, where the waits go off the loop like every other wait there:
+
+```python
+async with conn.stream("MATCH (p:person) RETURN p.name AS name") as rows:
+    async for (name,) in rows:
+        await write(name)
+```
+
 ## Preparing a statement
 
 A statement a program runs many times with different values can be compiled once and kept.
@@ -286,7 +317,7 @@ Half of this package is compiled, which is the one thing an inspection cannot se
 
 ## What works today
 
-The list above is what this client is for. What it does so far is the core of it: `connect`, `execute` and `sql` with named parameters, results that iterate and fetch, values as Python objects both ways including dates, times, datetimes and durations, `Node`, `Rel` and `Path` as classes, `load` for building a graph with edges in it, an appender for growing one, transactions as a context manager that commits at the end of a block and rolls back when it raises, every condition as an exception class carrying its code, its position and its documentation link, results as Arrow columns and as pandas and polars frames, `register` for putting a frame under a name a statement can match on and reading it where it lies, stubs inside the wheel with a gate that keeps them true, the GIL released around every statement, every load and every copy out, `Ctrl-C` and `interrupt()` stopping a statement without touching the connection under it, `zudb.aio` for the same calls awaited on an event loop, results, nodes, rels and paths that draw themselves in a notebook with `%gql` and `%%gql` to run statements in one, `zudb.dbapi` for code written against PEP 249, and `prepare`, `explain` and `profile` for a statement compiled once, the plan it would run and the plan it did. Each one landed with the tests that say it works.
+The list above is what this client is for. What it does so far is the core of it: `connect`, `execute` and `sql` with named parameters, results that iterate and fetch, values as Python objects both ways including dates, times, datetimes and durations, `Node`, `Rel` and `Path` as classes, `load` for building a graph with edges in it, an appender for growing one, transactions as a context manager that commits at the end of a block and rolls back when it raises, every condition as an exception class carrying its code, its position and its documentation link, results as Arrow columns and as pandas and polars frames, `register` for putting a frame under a name a statement can match on and reading it where it lies, stubs inside the wheel with a gate that keeps them true, the GIL released around every statement, every load and every copy out, `Ctrl-C` and `interrupt()` stopping a statement without touching the connection under it, `zudb.aio` for the same calls awaited on an event loop, results, nodes, rels and paths that draw themselves in a notebook with `%gql` and `%%gql` to run statements in one, `zudb.dbapi` for code written against PEP 249, `prepare`, `explain` and `profile` for a statement compiled once, the plan it would run and the plan it did, and `stream` for a result read as the engine makes it rather than after it has made all of it. Each one landed with the tests that say it works.
 
 ## Wheels
 
