@@ -126,6 +126,63 @@ result.record_batches()  # a reader, for a result larger than memory
 
 `Result` implements `__arrow_c_stream__`, so anything that reads the protocol reads a result directly and none of the four methods above is needed: `pyarrow.table(result)` and `polars.DataFrame(result)` both work. Batches are 65,536 rows. A column holds one type, which the values decide, and integers beside floats are the one mixture that widens rather than being refused. Nodes, rels and paths go across as structs. The copy runs with the GIL released, and on this machine 300,000 rows across three columns take 44 ms as Arrow against 67 ms as Python objects, and a single integer column takes 13.8 ms against 44.5 ms.
 
+## Preparing a statement
+
+A statement a program runs many times with different values can be compiled once and kept.
+
+```python
+find = conn.prepare("MATCH (p:person) WHERE p.name = $name RETURN p.uid AS uid")
+find.params  # ['name']
+find.execute({"name": "ada"}).fetchall()  # [(10,)]
+find.close()
+```
+
+```python
+with conn.prepare("INSERT (p:person {uid: $uid, name: $name})") as add:
+    for uid, name in people:
+        add.execute({"uid": uid, "name": name})
+```
+
+What it saves here is smaller than the word usually promises, and the number is worth printing rather than hiding. The database is in this process, so there is no round trip to skip, and the engine already keeps the plan it compiled for a statement under the text of that statement, so running the same text twice compiles it once whether anybody prepared it or not. On this machine, over two thousand rows, a prepared statement bound per run costs 30.1 microseconds, the same text passed to `execute` and bound per run costs 30.1, and a statement whose text differs every time costs 35.8. A statement of 1.2 KB with sixty predicates in it says the same thing: 34.9 microseconds either way. If you came here expecting the first number to be half the second, the honest answer is that `execute` was already doing what preparing does.
+
+What preparing does buy is worth having for other reasons. The compile happens at the line that asked for it, so a statement that will not compile fails where it was written rather than in the middle of a loop at three in the morning, and `params` tells the program which names the statement wants, which is the difference between binding what it asked for and finding out at the run that a key was misspelled. It also gives a name to the intent: a prepared statement is an object a program can pass around, hold on a class and close, and a program built around one is a program whose statements live in one place.
+
+A prepared statement belongs to the connection that made it. Closing it gives the statement back and is safe to do twice, closing the connection closes all of them, and a closed one refuses to run with a message that says so rather than a segfault. The `with` block closes it at the end, including the end an exception makes. `zudb.aio` has the same thing under `async with`, where `prepare`, `execute` and `close` are awaited and `statement`, `params` and `closed` are properties, since the names were read at the compile and nothing has to wait to say them again.
+
+## Seeing what a statement will do
+
+`explain` answers what the engine would run, and `profile` runs it and answers what it really did.
+
+```python
+plan = conn.explain("MATCH (p:person) WHERE p.name = $name RETURN p.uid AS uid")
+print(plan)
+# Project p.uid AS uid
+#   Filter p.name = $name
+#     ScanNodes p: person
+
+plan.columns  # ['uid']
+plan.params  # ['name']
+plan.root.op  # 'Project'
+plan.root.children[0].children[0].tables  # ['person']
+```
+
+Both calls answer twice over and that is deliberate. `print` gives the engine's own listing, which is what a person reads, and it is rendered by the engine rather than assembled here so that the listing and the plan cannot drift apart from one release to the next. `root` gives the same plan as objects, which is what a program walks: a test that wants to know a scan became a seek asks the tree, rather than matching on a string that was written to be read. An operator carries `op` for what it is, `name` for what the listing calls it, `detail` for what it works on, `binds` for the variables it introduces, `tables` for what it reads and `children` for what it pulls from. The two names differ where an operator sits inside a bracket, so an expand under an `OPTIONAL MATCH` has `op` `Expand`, `name` `OptionalExpand` and `bracket` `Optional`, and `op` is the one to match on because it is the one that does not change with the company the operator keeps.
+
+`explain` takes no parameters, which is not an oversight. A plan is chosen from the shape of the statement and the values are bound when it runs, so a plan asked for with values would suggest the values had changed it. It also does not run the statement, so explaining an `INSERT` inserts nothing. A query written where a value belongs gets a plan of its own in `scalars`, along with `reads`, which is which variables of the query around it that one reads and therefore whether the executor runs it once or once a row.
+
+```python
+run = conn.profile("MATCH (p:person) WHERE p.score > 40.0 RETURN p.name AS name")
+print(run)
+# stage 1: Project [2 rows, 247.8 us]
+#   Filter p.score > 40  pulls      1  rows        2  flat         2  est         1  q    2.0  ...
+#   Scan p: person       pulls      1  rows        3  flat         3  est         3  q    1.0  ...
+#   Source               pulls      1  rows        1  flat         1  est         -  q      -  ...
+```
+
+A profile takes parameters, because it is a run. `est` is what the optimizer thought an operator would produce and `rows` is what it did, so `qerror` is the larger of the two over the smaller: one where the estimate was right, ten where it was out by an order of magnitude either way, and that column is where a plan that went wrong announces itself. All three are `None` on an operator the optimizer had nothing to say about, which is honest rather than a zero somebody would read as an estimate of none. `stages[i].ops` runs from the operator that read to the one that fed the sink, which is the order they ran in and the reverse of the order the listing prints them in. Every count is an `int`, exact however large it gets.
+
+A statement that writes is refused rather than profiled, because a measurement that also inserted two rows changed the thing it was measuring, and because a write runs as the parts it was split at rather than as the one plan a profile describes. Explaining costs 1.3 microseconds, since the plan was already compiled and cached; profiling costs what the statement costs plus the counters. In a notebook both draw themselves as their listing, preformatted, since the indentation is what says which operator pulls from which.
+
 ## In a notebook
 
 A result in a cell draws itself as a table, because Jupyter asks an object for `_repr_html_` before it falls back to `repr` and a line saying how many rows there are is a strictly worse answer than the rows. Nodes, rels and paths draw themselves too, a path as the walk it is: `(person #0) -[knows]-> (person #1)`.
@@ -229,7 +286,7 @@ Half of this package is compiled, which is the one thing an inspection cannot se
 
 ## What works today
 
-The list above is what this client is for. What it does so far is the core of it: `connect`, `execute` and `sql` with named parameters, results that iterate and fetch, values as Python objects both ways including dates, times, datetimes and durations, `Node`, `Rel` and `Path` as classes, `load` for building a graph with edges in it, an appender for growing one, transactions as a context manager that commits at the end of a block and rolls back when it raises, every condition as an exception class carrying its code, its position and its documentation link, results as Arrow columns and as pandas and polars frames, `register` for putting a frame under a name a statement can match on and reading it where it lies, stubs inside the wheel with a gate that keeps them true, the GIL released around every statement, every load and every copy out, `Ctrl-C` and `interrupt()` stopping a statement without touching the connection under it, `zudb.aio` for the same calls awaited on an event loop, results, nodes, rels and paths that draw themselves in a notebook with `%gql` and `%%gql` to run statements in one, and `zudb.dbapi` for code written against PEP 249. Each one landed with the tests that say it works.
+The list above is what this client is for. What it does so far is the core of it: `connect`, `execute` and `sql` with named parameters, results that iterate and fetch, values as Python objects both ways including dates, times, datetimes and durations, `Node`, `Rel` and `Path` as classes, `load` for building a graph with edges in it, an appender for growing one, transactions as a context manager that commits at the end of a block and rolls back when it raises, every condition as an exception class carrying its code, its position and its documentation link, results as Arrow columns and as pandas and polars frames, `register` for putting a frame under a name a statement can match on and reading it where it lies, stubs inside the wheel with a gate that keeps them true, the GIL released around every statement, every load and every copy out, `Ctrl-C` and `interrupt()` stopping a statement without touching the connection under it, `zudb.aio` for the same calls awaited on an event loop, results, nodes, rels and paths that draw themselves in a notebook with `%gql` and `%%gql` to run statements in one, `zudb.dbapi` for code written against PEP 249, and `prepare`, `explain` and `profile` for a statement compiled once, the plan it would run and the plan it did. Each one landed with the tests that say it works.
 
 ## Wheels
 

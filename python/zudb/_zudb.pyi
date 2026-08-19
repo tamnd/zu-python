@@ -76,6 +76,15 @@ class Connection:
     def sql(self, statement: str, params: Mapping[str, Value] | None = None) -> Result:
         """The same call, named for the way it reads in a notebook."""
 
+    def prepare(self, statement: str) -> Prepared:
+        """Compiles a statement now and hands back something that runs it later."""
+
+    def explain(self, statement: str) -> Plan:
+        """What the statement would do, without doing it."""
+
+    def profile(self, statement: str, params: Mapping[str, Value] | None = None) -> Profile:
+        """Runs the statement with the counters on and answers what its operators really did."""
+
     def transaction(self, *, read_only: bool = False) -> Transaction:
         """Starts a transaction and hands it back for a `with` block."""
 
@@ -160,6 +169,205 @@ class Appender:
 
     def __enter__(self) -> Appender: ...
     def __exit__(self, *_exception: object) -> bool: ...
+    def __repr__(self) -> str: ...
+
+class Prepared:
+    """A statement the engine has compiled and is holding for you."""
+
+    @property
+    def statement(self) -> str:
+        """The text it was compiled from."""
+
+    @property
+    def params(self) -> list[str]:
+        """The names this statement wants bound, in the order it uses them."""
+
+    @property
+    def closed(self) -> bool:
+        """Whether this prepared statement has been closed."""
+
+    def execute(self, params: Mapping[str, Value] | None = None) -> Result:
+        """Runs it with these parameters and gives back its rows."""
+
+    def sql(self, params: Mapping[str, Value] | None = None) -> Result:
+        """The same call, named for the way it reads in a notebook."""
+
+    def close(self) -> None:
+        """Closes it and gives the statement back to the connection."""
+
+    def __enter__(self) -> Prepared: ...
+    def __exit__(self, *_exception: object) -> bool: ...
+    def __repr__(self) -> str: ...
+
+class PlanNode:
+    """One operator of a plan."""
+
+    @property
+    def op(self) -> str:
+        """The kind of operator this is."""
+
+    @property
+    def name(self) -> str:
+        """What the listing calls it, bracket and all."""
+
+    @property
+    def bracket(self) -> str | None:
+        """The bracket it sits inside, if it sits inside one."""
+
+    @property
+    def detail(self) -> str:
+        """What it works on, in the words the listing prints."""
+
+    @property
+    def binds(self) -> list[str]:
+        """The variables it introduces."""
+
+    @property
+    def tables(self) -> list[str]:
+        """The tables it reads."""
+
+    @property
+    def children(self) -> list[PlanNode]:
+        """What it pulls from, in the order the listing prints them."""
+
+    def __repr__(self) -> str: ...
+
+class ScalarPlan:
+    """A query written where a value belongs, and the plan it gets."""
+
+    @property
+    def reads(self) -> list[str]:
+        """The variables it reads from the query it is written inside."""
+
+    @property
+    def exists(self) -> bool:
+        """Whether it is asking whether there is a row rather than for one."""
+
+    @property
+    def plan(self) -> Plan:
+        """The plan itself."""
+
+    def __repr__(self) -> str: ...
+
+class Plan:
+    """What a statement would do, without doing it."""
+
+    @property
+    def root(self) -> PlanNode | None:
+        """The operator everything else feeds."""
+
+    @property
+    def columns(self) -> list[str]:
+        """The columns the statement projects, in order."""
+
+    @property
+    def params(self) -> list[str]:
+        """The parameters it wants bound."""
+
+    @property
+    def notes(self) -> list[str]:
+        """What the planner has to say about it, if anything."""
+
+    @property
+    def scalars(self) -> list[ScalarPlan]:
+        """The plans of the queries written where values belong."""
+
+    @property
+    def text(self) -> str:
+        """The engine's own listing, which is what `print` gives."""
+
+    def _repr_html_(self) -> str:
+        """The listing as a notebook shows it, which is the listing."""
+
+    def __str__(self) -> str: ...
+    def __repr__(self) -> str: ...
+
+class ProfileOp:
+    """One operator of a statement that ran, and what it really did."""
+
+    @property
+    def op(self) -> str:
+        """The kind of operator this is."""
+
+    @property
+    def detail(self) -> str:
+        """What it worked on, in the words the listing prints."""
+
+    @property
+    def pulls(self) -> int:
+        """How many times the operator above it asked for rows."""
+
+    @property
+    def rows(self) -> int:
+        """How many rows it answered with."""
+
+    @property
+    def flat(self) -> int:
+        """The same count with the vectors unpacked."""
+
+    @property
+    def estimate(self) -> float | None:
+        """What the optimizer thought it would answer."""
+
+    @property
+    def bound(self) -> float | None:
+        """The upper bound the optimizer had for it."""
+
+    @property
+    def nanos(self) -> int:
+        """How long it spent, in nanoseconds."""
+
+    @property
+    def qerror(self) -> float | None:
+        """The estimate over the truth, or the truth over the estimate,
+        whichever is the larger."""
+
+    def __repr__(self) -> str: ...
+
+class ProfileStage:
+    """One stage of a statement that ran."""
+
+    @property
+    def sink(self) -> str:
+        """What the stage feeds."""
+
+    @property
+    def rows(self) -> int:
+        """How many rows came out of it."""
+
+    @property
+    def nanos(self) -> int:
+        """How long it took, in nanoseconds."""
+
+    @property
+    def ops(self) -> list[ProfileOp]:
+        """Its operators, from the one that read to the one that fed the
+        sink, which is the order they ran in and the reverse of the order
+        the listing prints them.
+        """
+
+    def __repr__(self) -> str: ...
+
+class Profile:
+    """What a statement did, measured while it did it."""
+
+    @property
+    def stages(self) -> list[ProfileStage]:
+        """The stages, in the order they ran."""
+
+    @property
+    def nanos(self) -> int:
+        """Every stage added up, in nanoseconds."""
+
+    @property
+    def text(self) -> str:
+        """The engine's own listing, which is what `print` gives."""
+
+    def _repr_html_(self) -> str:
+        """The listing as a notebook shows it, preformatted for the reason
+        a plan's is."""
+
+    def __str__(self) -> str: ...
     def __repr__(self) -> str: ...
 
 class Result:
