@@ -4,8 +4,8 @@ This is the script behind `docs/clients/duckdb.md` in the engine tree,
 kept in the repository so the numbers in that page can be reproduced
 rather than believed. A million rows of three columns, an integer, a
 double and a short string, in a stored table on both sides, and the
-fastest of five runs for each call, because what is being compared is
-the code path and not the scheduler.
+fastest of nine alternating runs for each call, because what is being
+compared is the code path and not the scheduler.
 
 One row of the output is not a comparison and is marked as such.
 DuckDB's `execute` hands back a result nobody has read yet, so what it
@@ -27,17 +27,25 @@ import duckdb
 import zudb
 
 ROWS = 1_000_000
-RUNS = 5
+RUNS = 9
 
 
-def best(run) -> float:
-    """The fastest of `RUNS`, in seconds."""
-    fastest = float("inf")
+def duel(ours, theirs) -> tuple[float, float]:
+    """The fastest of `RUNS` for each, run alternately.
+
+    Alternately rather than one after the other, which matters more than
+    the number of runs does. A laptop is not a quiet machine, and
+    timing all of one call and then all of the other hands whichever
+    went second whatever the machine was doing by then. Interleaving
+    gives both of them the same weather.
+    """
+    fastest = [float("inf"), float("inf")]
     for _ in range(RUNS):
-        at = time.perf_counter()
-        run()
-        fastest = min(fastest, time.perf_counter() - at)
-    return fastest
+        for at, run in enumerate((ours, theirs)):
+            started = time.perf_counter()
+            run()
+            fastest[at] = min(fastest[at], time.perf_counter() - started)
+    return fastest[0], fastest[1]
 
 
 def read(call):
@@ -95,23 +103,27 @@ def _arrow(data):
     )
 
 
-def line(label: str, ours: float, theirs: float, note: str = "") -> None:
-    if note:
-        ratio = note
-    elif ours < theirs:
-        ratio = f"{theirs / ours:.1f}x faster"
-    else:
-        ratio = f"{ours / theirs:.1f}x slower"
-    print(f"| {label} | {ours * 1e3:.0f} ms | {theirs * 1e3:.0f} ms | {ratio} |")
+def ms(seconds: float) -> str:
+    """Milliseconds, with a decimal only where dropping it would round
+    the figure to nothing."""
+    return f"{seconds * 1e3:.1f} ms" if seconds < 0.01 else f"{seconds * 1e3:.0f} ms"
 
 
-def micro(label: str, ours: float, theirs: float) -> None:
-    """The same row, for a call small enough to read in microseconds."""
+def ratio(ours: float, theirs: float) -> str:
     if ours < theirs:
-        ratio = f"{theirs / ours:.1f}x faster"
-    else:
-        ratio = f"{ours / theirs:.1f}x slower"
-    print(f"| {label} | {ours * 1e6:.1f} us | {theirs * 1e6:.1f} us | {ratio} |")
+        return f"{theirs / ours:.1f}x faster"
+    return f"{ours / theirs:.1f}x slower"
+
+
+def line(label: str, ours, theirs, note: str = "") -> None:
+    ours, theirs = duel(ours, theirs)
+    print(f"| {label} | {ms(ours)} | {ms(theirs)} | {note or ratio(ours, theirs)} |")
+
+
+def micro(label: str, ours, theirs) -> None:
+    """The same row, for a call small enough to read in microseconds."""
+    ours, theirs = duel(ours, theirs)
+    print(f"| {label} | {ours * 1e6:.1f} us | {theirs * 1e6:.1f} us | {ratio(ours, theirs)} |")
 
 
 def main() -> None:
@@ -125,14 +137,14 @@ def main() -> None:
         print("|---|---|---|---|")
         line(
             "execute, nothing read",
-            best(lambda: zu.execute(query)),
-            best(lambda: duck.execute(sql)),
+            lambda: zu.execute(query),
+            lambda: duck.execute(sql),
             note="not a comparison",
         )
         line(
             "execute and `fetchall`",
-            best(read(lambda: len(zu.execute(query).fetchall()))),
-            best(read(lambda: len(duck.execute(sql).fetchall()))),
+            read(lambda: len(zu.execute(query).fetchall())),
+            read(lambda: len(duck.execute(sql).fetchall())),
         )
         # DuckDB's `arrow()` hands back a `RecordBatchReader` that has
         # read nothing, which times at nought and is not the same call.
@@ -140,13 +152,13 @@ def main() -> None:
         # returns, which is what ours does.
         line(
             "execute and Arrow table",
-            best(read(lambda: zu.execute(query).to_arrow().num_rows)),
-            best(read(lambda: duck.execute(sql).to_arrow_table().num_rows)),
+            read(lambda: zu.execute(query).to_arrow().num_rows),
+            read(lambda: duck.execute(sql).to_arrow_table().num_rows),
         )
         line(
             "execute and pandas",
-            best(read(lambda: len(zu.execute(query).to_pandas()))),
-            best(read(lambda: len(duck.execute(sql).df()))),
+            read(lambda: len(zu.execute(query).to_pandas())),
+            read(lambda: len(duck.execute(sql).df())),
         )
 
         point = "MATCH (r:row) WHERE r.id = 500000 RETURN r.f"
@@ -167,21 +179,21 @@ def main() -> None:
         print("|---|---|---|---|")
         micro(
             "point read, whole call",
-            best(lambda: zu.execute(point).fetchall()),
-            best(lambda: duck.execute(point_sql).fetchall()),
+            lambda: zu.execute(point).fetchall(),
+            lambda: duck.execute(point_sql).fetchall(),
         )
         micro(
             "`register` and `unregister`, numbers",
-            best(swap(zu, numbers)),
-            best(swap(duck, numbers)),
+            swap(zu, numbers),
+            swap(duck, numbers),
         )
         # The same call with a string column in the frame, which is a
         # different answer and is why both are printed: the bytes get
         # a validation pass on the way in and the numbers do not.
         micro(
             "`register` and `unregister`, with strings",
-            best(swap(zu, table)),
-            best(swap(duck, table)),
+            swap(zu, table),
+            swap(duck, table),
         )
 
         zu.close()
