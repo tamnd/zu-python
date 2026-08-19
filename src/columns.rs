@@ -15,41 +15,57 @@
 //! version of pyarrow it has to agree with, because the interface is a
 //! C struct and not a Python API.
 //!
-//! A column has one type, which the values decide: the first one that
-//! is not null settles it and every value after it has to fit. Integers
-//! widen to floats where a column holds both, since that is the one
-//! mixture a projection produces by accident and the one no reader is
-//! surprised by. Everything else that does not fit is refused, naming
-//! the column and the row, because a column that quietly became strings
-//! is worse than one that would not build.
+//! The columns themselves are not built here. `zudb::query::column`
+//! reads a result down its columns in the engine, in two passes over
+//! the rows, and hands back one owned buffer per column in the layout
+//! Arrow already uses: values end to end, a validity bitmap that is
+//! absent when nothing is null, strings as bytes and offsets. This
+//! module takes those buffers and puts an Arrow array around them,
+//! which for integers, floats, booleans, strings, dates, times,
+//! datetimes and durations is a move and not a copy. `docs/clients/duckdb.md`
+//! in the engine tree is why: this file used to walk the whole result
+//! once per column to infer a type and once per column per batch to
+//! gather pointers, and that transpose was the twenty.
+//!
+//! What is left to build by hand is what no buffer covers: nodes, rels,
+//! paths, lists and records, which arrive as borrowed values and become
+//! structs and lists the way they always did. They are also the columns
+//! nobody exports a million of.
+//!
+//! A column has one type, which the engine decides and this module only
+//! translates. Two refusals stay here, because they are Arrow's facts
+//! and not the engine's: a time with an offset has no Arrow type, and
+//! neither has a handle to a graph or a binding table.
 
 use std::collections::HashMap;
 use std::sync::Arc;
 
 use arrow::array::{
-    ArrayRef, BooleanArray, Date32Array, DurationNanosecondArray, Float64Array, Int64Array,
-    IntervalMonthDayNanoArray, ListArray, NullArray, StringArray, StructArray,
+    Array, ArrayRef, BooleanArray, Date32Array, DurationNanosecondArray, Float64Array, Int64Array,
+    IntervalMonthDayNanoArray, LargeStringArray, ListArray, NullArray, StringArray, StructArray,
     Time64NanosecondArray, TimestampNanosecondArray, UInt64Array,
 };
-use arrow::buffer::{NullBuffer, OffsetBuffer};
+use arrow::buffer::{BooleanBuffer, Buffer, NullBuffer, OffsetBuffer, ScalarBuffer};
 use arrow::datatypes::{
-    DataType, Field, FieldRef, Fields, IntervalMonthDayNano, IntervalUnit, Schema, TimeUnit,
+    DataType, Field, FieldRef, Fields, IntervalMonthDayNano, IntervalUnit, Schema, SchemaRef,
+    TimeUnit,
 };
 use arrow::error::ArrowError;
 use arrow::ffi_stream::FFI_ArrowArrayStream;
-use arrow::record_batch::{RecordBatch, RecordBatchIterator};
+use arrow::record_batch::{RecordBatch, RecordBatchOptions, RecordBatchReader};
 use pyo3::prelude::*;
 use zu_common::{DurationKind, Temporal};
+use zudb::query::column::{ColumnData, ColumnType, Offsets, Validity};
 use zudb::query::{QueryResult, Value};
 
 use crate::value::Names;
 
 /// How many rows go in one record batch.
 ///
-/// A result is already in memory, so this is not about streaming a
-/// table too big to hold: it is about the copy. Batching keeps the
-/// Arrow buffers a reader has to allocate down to a working set that
-/// fits in cache, and it is what every other Arrow producer does.
+/// A result is already in memory and the arrays are built whole, so a
+/// batch is a view into them rather than a copy: the boundary exists
+/// because readers expect one and because a working set that fits in
+/// cache is faster to consume, not because anything is allocated at it.
 const BATCH: usize = 65_536;
 
 /// What goes wrong here, with the GIL down and no way to raise yet.
@@ -86,92 +102,37 @@ impl From<ArrowError> for Snag {
     }
 }
 
-/// The type of one column, as this module thinks about it.
-///
-/// Arrow's `DataType` is what it turns into, but not what it is
-/// decided as: a node, a rel and a record all become structs, and
-/// telling them apart afterwards by their field names would be reading
-/// tea leaves. Deciding it once and carrying it is also what makes the
-/// second pass, the one that fills the buffers, a match with no
-/// re-inspection of the values in it.
-#[derive(Clone, PartialEq)]
-enum Kind {
-    /// Nothing but nulls, which Arrow has a type for.
-    Null,
-    Bool,
-    Int,
-    Float,
-    Str,
-    Date,
-    Time,
-    LocalDatetime,
-    /// A datetime with an offset, in minutes from UTC. The values are
-    /// instants, so the offset is how the column prints and not what it
-    /// holds; the first one in the column names the zone.
-    ZonedDatetime(i16),
-    YearMonth,
-    DayTime,
-    Node,
-    Rel,
-    Path,
-    List(Box<Kind>),
-    Record(Vec<(String, Kind)>),
+/// A buffer that does not match the type the engine decided for it,
+/// which is this module reading its own input wrong.
+fn mismatch(name: &str, ty: &ColumnType) -> Snag {
+    Snag::Arrow(ArrowError::SchemaError(format!(
+        "column '{name}' came back as {} in a buffer that does not hold one",
+        ty.name()
+    )))
 }
 
-impl Kind {
-    fn name(&self) -> String {
-        match self {
-            Kind::Null => "nulls".into(),
-            Kind::Bool => "booleans".into(),
-            Kind::Int => "integers".into(),
-            Kind::Float => "floats".into(),
-            Kind::Str => "strings".into(),
-            Kind::Date => "dates".into(),
-            Kind::Time => "times".into(),
-            Kind::LocalDatetime => "datetimes".into(),
-            Kind::ZonedDatetime(_) => "zoned datetimes".into(),
-            Kind::YearMonth => "year-month durations".into(),
-            Kind::DayTime => "day-time durations".into(),
-            Kind::Node => "nodes".into(),
-            Kind::Rel => "rels".into(),
-            Kind::Path => "paths".into(),
-            Kind::List(of) => format!("lists of {}", of.name()),
-            Kind::Record(_) => "records".into(),
-        }
-    }
-
-    fn data_type(&self) -> DataType {
-        match self {
-            Kind::Null => DataType::Null,
-            Kind::Bool => DataType::Boolean,
-            Kind::Int => DataType::Int64,
-            Kind::Float => DataType::Float64,
-            Kind::Str => DataType::Utf8,
-            Kind::Date => DataType::Date32,
-            Kind::Time => DataType::Time64(TimeUnit::Nanosecond),
-            Kind::LocalDatetime => DataType::Timestamp(TimeUnit::Nanosecond, None),
-            Kind::ZonedDatetime(offset) => {
-                DataType::Timestamp(TimeUnit::Nanosecond, Some(zone(*offset).into()))
-            }
-            // Arrow has a year-month interval, which is exactly what
-            // this is, and pyarrow cannot build a Python array of one:
-            // its type id has no class behind it, so reading such a
-            // column raises `KeyError: 21`. Month-day-nano is the
-            // interval every reader implements, and a year-month
-            // duration is one with no days and no nanoseconds in it.
-            Kind::YearMonth => DataType::Interval(IntervalUnit::MonthDayNano),
-            Kind::DayTime => DataType::Duration(TimeUnit::Nanosecond),
-            Kind::Node => DataType::Struct(node_fields()),
-            Kind::Rel => DataType::Struct(rel_fields()),
-            Kind::Path => DataType::Struct(path_fields()),
-            Kind::List(of) => DataType::List(item(of.data_type())),
-            Kind::Record(fields) => DataType::Struct(
-                fields
-                    .iter()
-                    .map(|(name, kind)| Arc::new(Field::new(name, kind.data_type(), true)))
-                    .collect(),
-            ),
-        }
+/// The refusal for a type Arrow has nowhere to put.
+///
+/// Two of them, and both are Arrow's facts rather than the engine's,
+/// which is why they live in the client and not in `columnar()`.
+fn unsupported(name: &str, ty: &ColumnType) -> Snag {
+    match ty {
+        // Arrow has a time and a timestamp and nothing in between:
+        // there is no time-with-offset type to put this in, and
+        // dropping the offset would move the value.
+        ColumnType::ZonedTime { .. } => Snag::Type(format!(
+            "column '{name}' holds a time with an offset, which Arrow has no type for"
+        )),
+        // GV60 and GV61. A handle is a reference, and a column of
+        // references is a column of nothing a frame can hold: the graph
+        // is in the file and the binding table is behind the handle. A
+        // caller who wants one in a frame reads the rows, where it
+        // arrives as the string that names it, or projects the columns
+        // of the table instead of the table.
+        ColumnType::Graph | ColumnType::BindingTable => Snag::Type(format!(
+            "column '{name}' holds a reference to a graph or a binding table, which Arrow has no type for"
+        )),
+        _ => mismatch(name, ty),
     }
 }
 
@@ -224,177 +185,233 @@ fn zone(offset: i16) -> String {
     format!("{sign}{:02}:{:02}", minutes / 60, minutes % 60)
 }
 
-/// The stream a result exports, batches and schema and all.
+/// The Arrow type a column type becomes, and the two places where the
+/// answer is that it does not become one.
 ///
-/// Built whole rather than lazily: the rows are already in memory, so a
-/// reader that pulls one batch at a time would only be deferring a copy
-/// it is going to ask for anyway, and building it here is what lets the
-/// refusals happen while there is still a caller to raise them at.
-pub fn stream(result: &QueryResult, names: &Names) -> Result<FFI_ArrowArrayStream, Snag> {
-    let kinds = result
-        .columns
-        .iter()
-        .enumerate()
-        .map(|(at, name)| infer(name, result.rows.iter().map(|row| &row[at])))
-        .collect::<Result<Vec<_>, Snag>>()?;
-    let schema = Arc::new(Schema::new(
-        result
-            .columns
-            .iter()
-            .zip(&kinds)
-            .map(|(name, kind)| field(name, kind.data_type()))
-            .collect::<Fields>(),
-    ));
-
-    let mut batches = Vec::new();
-    let mut at = 0;
-    while at < result.rows.len() {
-        let rows = &result.rows[at..(at + BATCH).min(result.rows.len())];
-        let columns = kinds
-            .iter()
-            .enumerate()
-            .map(|(ix, kind)| {
-                let values: Vec<&Value> = rows.iter().map(|row| &row[ix]).collect();
-                build(kind, &values, names)
-            })
-            .collect::<Result<Vec<_>, Snag>>()?;
-        batches.push(RecordBatch::try_new(schema.clone(), columns)?);
-        at += BATCH;
-    }
-    // A result with no rows is still a result: it has a schema, and a
-    // reader that gets no batch at all cannot tell what the columns
-    // were. One empty batch says both.
-    if batches.is_empty() {
-        let columns = kinds
-            .iter()
-            .map(|kind| build(kind, &[], names))
-            .collect::<Result<Vec<_>, Snag>>()?;
-        batches.push(RecordBatch::try_new(schema.clone(), columns)?);
-    }
-
-    let reader = RecordBatchIterator::new(batches.into_iter().map(Ok), schema);
-    Ok(FFI_ArrowArrayStream::new(Box::new(reader)))
-}
-
-/// The type of a column, from the values in it.
-fn infer<'a>(name: &str, values: impl Iterator<Item = &'a Value>) -> Result<Kind, Snag> {
-    let mut kind = Kind::Null;
-    for (row, value) in values.enumerate() {
-        let found = kind_of(name, row, value)?;
-        let (held, arrived) = (kind.name(), found.name());
-        kind = unify(kind, found).ok_or_else(|| {
-            Snag::Type(format!(
-                "column '{name}' mixes {held} and {arrived} at row {row}, and an Arrow column holds one type"
-            ))
-        })?;
-    }
-    Ok(kind)
-}
-
-/// The type of one value, on its own.
-fn kind_of(name: &str, row: usize, value: &Value) -> Result<Kind, Snag> {
-    Ok(match value {
-        Value::Null => Kind::Null,
-        Value::Bool(_) => Kind::Bool,
-        Value::Int(_) => Kind::Int,
-        Value::Float(_) => Kind::Float,
-        Value::Str(_) => Kind::Str,
-        Value::Node { .. } => Kind::Node,
-        Value::Rel { .. } => Kind::Rel,
-        Value::Path(_) => Kind::Path,
-        Value::List(items) => {
-            let mut of = Kind::Null;
-            for item in items {
-                let found = kind_of(name, row, item)?;
-                let (held, arrived) = (of.name(), found.name());
-                of = unify(of, found).ok_or_else(|| {
-                    Snag::Type(format!(
-                        "the list at row {row} of column '{name}' mixes {held} and {arrived}, and an Arrow list holds one type"
-                    ))
-                })?;
-            }
-            Kind::List(Box::new(of))
+/// The column name rides along because a refusal without it sends
+/// somebody to read a schema by hand, and because a nested refusal is
+/// still about the column it is nested in.
+fn data_type(name: &str, ty: &ColumnType) -> Result<DataType, Snag> {
+    Ok(match ty {
+        ColumnType::Null => DataType::Null,
+        ColumnType::Bool => DataType::Boolean,
+        ColumnType::Int => DataType::Int64,
+        ColumnType::Float => DataType::Float64,
+        ColumnType::Str => DataType::Utf8,
+        ColumnType::Date => DataType::Date32,
+        ColumnType::LocalTime => DataType::Time64(TimeUnit::Nanosecond),
+        ColumnType::LocalDatetime => DataType::Timestamp(TimeUnit::Nanosecond, None),
+        ColumnType::ZonedDatetime { offset } => {
+            DataType::Timestamp(TimeUnit::Nanosecond, Some(zone(*offset).into()))
         }
-        Value::Record(fields) => Kind::Record(
+        // Arrow has a year-month interval, which is exactly what this
+        // is, and pyarrow cannot build a Python array of one: its type
+        // id has no class behind it, so reading such a column raises
+        // `KeyError: 21`. Month-day-nano is the interval every reader
+        // implements, and a year-month duration is one with no days and
+        // no nanoseconds in it.
+        ColumnType::YearMonth => DataType::Interval(IntervalUnit::MonthDayNano),
+        ColumnType::DayTime => DataType::Duration(TimeUnit::Nanosecond),
+        ColumnType::Node => DataType::Struct(node_fields()),
+        ColumnType::Rel => DataType::Struct(rel_fields()),
+        ColumnType::Path => DataType::Struct(path_fields()),
+        ColumnType::List(of) => DataType::List(item(data_type(name, of)?)),
+        ColumnType::Record(fields) => DataType::Struct(
             fields
                 .iter()
-                .map(|(field, value)| Ok((field.clone(), kind_of(name, row, value)?)))
-                .collect::<Result<Vec<_>, Snag>>()?,
+                .map(|(held, ty)| Ok(field(held, data_type(name, ty)?)))
+                .collect::<Result<Fields, Snag>>()?,
         ),
-        Value::Temporal(temporal) => match temporal {
-            Temporal::Date(_) => Kind::Date,
-            Temporal::LocalTime(_) => Kind::Time,
-            Temporal::LocalDatetime(_) => Kind::LocalDatetime,
-            Temporal::ZonedDatetime { offset, .. } => Kind::ZonedDatetime(*offset),
-            Temporal::Duration(DurationKind::YearMonth, _) => Kind::YearMonth,
-            Temporal::Duration(DurationKind::DayTime, _) => Kind::DayTime,
-            // Arrow has a time and a timestamp and nothing in between:
-            // there is no time-with-offset type to put this in, and
-            // dropping the offset would move the value.
-            Temporal::ZonedTime { .. } => {
-                return Err(Snag::Type(format!(
-                    "row {row} of column '{name}' is a time with an offset, which Arrow has no type for"
-                )));
-            }
+        ColumnType::ZonedTime { .. } | ColumnType::Graph | ColumnType::BindingTable => {
+            return Err(unsupported(name, ty));
+        }
+    })
+}
+
+/// The stream a result exports, batches and schema and all.
+///
+/// One array per column, built once out of the engine's buffers, and
+/// batches that are slices of them. The arrays are built eagerly
+/// because the refusals have to happen while there is still a caller to
+/// raise them at; the batches are not, so `record_batches` no longer
+/// builds a second copy of the table before it hands back a reader.
+pub fn stream(result: &QueryResult, names: &Names) -> Result<FFI_ArrowArrayStream, Snag> {
+    let columns = result
+        .columnar()
+        .map_err(|mixed| Snag::Type(mixed.to_string()))?;
+    let rows = columns.rows;
+
+    let mut fields = Vec::with_capacity(columns.len());
+    let mut arrays = Vec::with_capacity(columns.len());
+    for held in columns.columns {
+        let array = column(
+            held.name,
+            &held.ty,
+            held.data,
+            held.validity,
+            held.len,
+            names,
+        )?;
+        fields.push(field(held.name, array.data_type().clone()));
+        arrays.push(array);
+    }
+
+    let schema = Arc::new(Schema::new(Fields::from(fields)));
+    Ok(FFI_ArrowArrayStream::new(Box::new(Slices {
+        schema,
+        arrays,
+        rows,
+        at: 0,
+        given: 0,
+    })))
+}
+
+/// The batches, cut out of the finished arrays as they are asked for.
+///
+/// A result with no rows still has a schema, and a reader that gets no
+/// batch at all cannot tell what the columns were, so an empty result
+/// gives one empty batch and then stops.
+struct Slices {
+    schema: SchemaRef,
+    arrays: Vec<ArrayRef>,
+    rows: usize,
+    at: usize,
+    given: usize,
+}
+
+impl Iterator for Slices {
+    type Item = Result<RecordBatch, ArrowError>;
+
+    fn next(&mut self) -> Option<Result<RecordBatch, ArrowError>> {
+        if self.at >= self.rows && self.given > 0 {
+            return None;
+        }
+        let take = BATCH.min(self.rows - self.at);
+        let columns: Vec<ArrayRef> = self
+            .arrays
+            .iter()
+            .map(|array| array.slice(self.at, take))
+            .collect();
+        self.at += take;
+        self.given += 1;
+        // The row count goes in by hand because a result with no
+        // columns still has rows, and a batch of no columns cannot say
+        // how many any other way.
+        Some(RecordBatch::try_new_with_options(
+            self.schema.clone(),
+            columns,
+            &RecordBatchOptions::new().with_row_count(Some(take)),
+        ))
+    }
+}
+
+impl RecordBatchReader for Slices {
+    fn schema(&self) -> SchemaRef {
+        self.schema.clone()
+    }
+}
+
+/// The bitmap Arrow keeps beside a buffer, out of the one the engine
+/// filled. Absent means every row has a value, in both layouts.
+fn nulls(validity: Option<Validity>) -> Option<NullBuffer> {
+    validity
+        .map(|held| NullBuffer::new(BooleanBuffer::new(Buffer::from_vec(held.bits), 0, held.len)))
+}
+
+/// One whole column as an Arrow array.
+///
+/// Every flat arm here moves a `Vec` into an Arrow buffer and allocates
+/// nothing: the engine filled it in the layout Arrow reads, and the
+/// only work left is putting a type and a bitmap around it. The two
+/// exceptions are year-month intervals, which are 96 bits in Arrow and
+/// 64 in the engine, and the complex types, which have no buffer.
+fn column(
+    name: &str,
+    ty: &ColumnType,
+    data: ColumnData<'_>,
+    validity: Option<Validity>,
+    len: usize,
+    names: &Names,
+) -> Result<ArrayRef, Snag> {
+    let valid = nulls(validity);
+    Ok(match data {
+        ColumnData::Null => Arc::new(NullArray::new(len)),
+        ColumnData::Bool { bits } => Arc::new(BooleanArray::new(
+            BooleanBuffer::new(Buffer::from_vec(bits), 0, len),
+            valid,
+        )),
+        ColumnData::Int(values) => Arc::new(Int64Array::new(ScalarBuffer::from(values), valid)),
+        ColumnData::Float(values) => Arc::new(Float64Array::new(ScalarBuffer::from(values), valid)),
+        ColumnData::Str(held) => match held.offsets {
+            Offsets::I32(offsets) => Arc::new(StringArray::try_new(
+                OffsetBuffer::new(ScalarBuffer::from(offsets)),
+                Buffer::from_vec(held.bytes),
+                valid,
+            )?),
+            // Past two gigabytes of text in one column, which is where
+            // a 32 bit offset stops addressing the bytes. Arrow's own
+            // answer is the wider type and every reader has it.
+            Offsets::I64(offsets) => Arc::new(LargeStringArray::try_new(
+                OffsetBuffer::new(ScalarBuffer::from(offsets)),
+                Buffer::from_vec(held.bytes),
+                valid,
+            )?),
         },
-        // GV60 and GV61. A handle is a reference, and a column of
-        // references is a column of nothing a frame can hold: the
-        // graph is in the file and the binding table is behind the
-        // handle. A caller who wants one in a frame reads the rows,
-        // where it arrives as the string that names it, or projects
-        // the columns of the table instead of the table.
-        Value::Graph(_) | Value::BindingTable(_) => {
-            return Err(Snag::Type(format!(
-                "row {row} of column '{name}' is a reference to a graph or a binding table, which Arrow has no type for"
-            )));
+        ColumnData::Days(values) => Arc::new(Date32Array::new(ScalarBuffer::from(values), valid)),
+        ColumnData::Nanos(values) => {
+            let values = ScalarBuffer::from(values);
+            match ty {
+                ColumnType::LocalTime => Arc::new(Time64NanosecondArray::new(values, valid)),
+                ColumnType::LocalDatetime => Arc::new(TimestampNanosecondArray::new(values, valid)),
+                ColumnType::ZonedDatetime { offset } => Arc::new(
+                    TimestampNanosecondArray::new(values, valid).with_timezone(zone(*offset)),
+                ),
+                ColumnType::DayTime => Arc::new(DurationNanosecondArray::new(values, valid)),
+                // A time with an offset fills a nanosecond buffer like
+                // any other time, and this is where it stops.
+                _ => return Err(unsupported(name, ty)),
+            }
         }
-        // Never in a result: the executor settles a chain into its
-        // edges before the rows leave the pipeline.
-        Value::Chain(_) => {
-            return Err(Snag::Type(format!(
-                "row {row} of column '{name}' is a path chain, which is internal to the executor"
-            )));
-        }
+        ColumnData::Months(counts) => Arc::new(IntervalMonthDayNanoArray::new(
+            ScalarBuffer::from(months(name, &counts)?),
+            valid,
+        )),
+        // The types with no buffer: nodes, rels, paths, lists, records,
+        // and the two handles, which reach here as values and are
+        // refused there.
+        ColumnData::Complex(values) => build(name, ty, &values, names)?,
     })
 }
 
-/// The one type two types are both, or `None` when they are not.
-fn unify(left: Kind, right: Kind) -> Option<Kind> {
-    Some(match (left, right) {
-        (Kind::Null, other) | (other, Kind::Null) => other,
-        // The one widening: a projection that returns an integer for
-        // one row and a float for another means a number, and every
-        // reader of the column reads it as one.
-        (Kind::Int, Kind::Float) | (Kind::Float, Kind::Int) => Kind::Float,
-        // The first zoned value in the column names the zone. Later
-        // rows may have been written elsewhere, and they are the same
-        // instant either way, so this changes how a column prints and
-        // never what it holds.
-        (Kind::ZonedDatetime(offset), Kind::ZonedDatetime(_)) => Kind::ZonedDatetime(offset),
-        (Kind::List(left), Kind::List(right)) => Kind::List(Box::new(unify(*left, *right)?)),
-        (Kind::Record(left), Kind::Record(right)) => {
-            if left.len() != right.len() {
-                return None;
-            }
-            let mut fields = Vec::with_capacity(left.len());
-            for ((name, left), (other, right)) in left.into_iter().zip(right) {
-                if name != other {
-                    return None;
-                }
-                fields.push((name, unify(left, right)?));
-            }
-            Kind::Record(fields)
-        }
-        (left, right) if left == right => left,
-        _ => return None,
-    })
+/// Month counts as the interval Arrow carries them in.
+///
+/// Arrow counts the months of an interval in 32 bits and the engine
+/// counts them in 64, so the far end of the range has nowhere to go.
+/// Refusing it is the only honest answer; wrapping would move the value
+/// by centuries.
+fn months(name: &str, counts: &[i64]) -> Result<Vec<IntervalMonthDayNano>, Snag> {
+    let mut months = Vec::with_capacity(counts.len());
+    for (row, count) in counts.iter().enumerate() {
+        let count = i32::try_from(*count).map_err(|_| {
+            Snag::Value(format!(
+                "the duration at row {row} of column '{name}' is {count} months, which is more than an Arrow interval holds"
+            ))
+        })?;
+        months.push(IntervalMonthDayNano::new(count, 0, 0));
+    }
+    Ok(months)
 }
 
-/// One column's array, filled from the values in it.
-fn build(kind: &Kind, values: &[&Value], names: &Names) -> Result<ArrayRef, Snag> {
-    Ok(match kind {
-        Kind::Null => Arc::new(NullArray::new(values.len())),
-        Kind::Bool => Arc::new(
+/// One column's array, walked out of the values in it.
+///
+/// This is the slow path and it is where the complex types live: the
+/// top level reaches it only for nodes, rels, paths, lists and records,
+/// and everything below the top level reaches it always, because a list
+/// item and a record field are values wherever they sit.
+fn build(name: &str, ty: &ColumnType, values: &[&Value], names: &Names) -> Result<ArrayRef, Snag> {
+    Ok(match ty {
+        ColumnType::Null => Arc::new(NullArray::new(values.len())),
+        ColumnType::Bool => Arc::new(
             values
                 .iter()
                 .map(|value| match value {
@@ -403,7 +420,7 @@ fn build(kind: &Kind, values: &[&Value], names: &Names) -> Result<ArrayRef, Snag
                 })
                 .collect::<BooleanArray>(),
         ),
-        Kind::Int => Arc::new(
+        ColumnType::Int => Arc::new(
             values
                 .iter()
                 .map(|value| match value {
@@ -412,7 +429,7 @@ fn build(kind: &Kind, values: &[&Value], names: &Names) -> Result<ArrayRef, Snag
                 })
                 .collect::<Int64Array>(),
         ),
-        Kind::Float => Arc::new(
+        ColumnType::Float => Arc::new(
             values
                 .iter()
                 .map(|value| match value {
@@ -424,7 +441,7 @@ fn build(kind: &Kind, values: &[&Value], names: &Names) -> Result<ArrayRef, Snag
                 })
                 .collect::<Float64Array>(),
         ),
-        Kind::Str => Arc::new(
+        ColumnType::Str => Arc::new(
             values
                 .iter()
                 .map(|value| match value {
@@ -433,7 +450,7 @@ fn build(kind: &Kind, values: &[&Value], names: &Names) -> Result<ArrayRef, Snag
                 })
                 .collect::<StringArray>(),
         ),
-        Kind::Date => Arc::new(
+        ColumnType::Date => Arc::new(
             temporals(values)
                 .map(|temporal| match temporal {
                     Some(Temporal::Date(days)) => Some(*days),
@@ -441,7 +458,7 @@ fn build(kind: &Kind, values: &[&Value], names: &Names) -> Result<ArrayRef, Snag
                 })
                 .collect::<Date32Array>(),
         ),
-        Kind::Time => Arc::new(
+        ColumnType::LocalTime => Arc::new(
             temporals(values)
                 .map(|temporal| match temporal {
                     Some(Temporal::LocalTime(nanos)) => Some(*nanos),
@@ -449,7 +466,7 @@ fn build(kind: &Kind, values: &[&Value], names: &Names) -> Result<ArrayRef, Snag
                 })
                 .collect::<Time64NanosecondArray>(),
         ),
-        Kind::LocalDatetime => Arc::new(
+        ColumnType::LocalDatetime => Arc::new(
             temporals(values)
                 .map(|temporal| match temporal {
                     Some(Temporal::LocalDatetime(nanos)) => Some(*nanos),
@@ -457,7 +474,7 @@ fn build(kind: &Kind, values: &[&Value], names: &Names) -> Result<ArrayRef, Snag
                 })
                 .collect::<TimestampNanosecondArray>(),
         ),
-        Kind::ZonedDatetime(offset) => Arc::new(
+        ColumnType::ZonedDatetime { offset } => Arc::new(
             temporals(values)
                 .map(|temporal| match temporal {
                     Some(Temporal::ZonedDatetime { nanos, .. }) => Some(*nanos),
@@ -466,29 +483,27 @@ fn build(kind: &Kind, values: &[&Value], names: &Names) -> Result<ArrayRef, Snag
                 .collect::<TimestampNanosecondArray>()
                 .with_timezone(zone(*offset)),
         ),
-        Kind::YearMonth => {
-            let mut months = Vec::with_capacity(values.len());
-            for (row, temporal) in temporals(values).enumerate() {
-                months.push(match temporal {
+        ColumnType::YearMonth => {
+            let mut counts = Vec::with_capacity(values.len());
+            let mut valid = Vec::with_capacity(values.len());
+            for temporal in temporals(values) {
+                match temporal {
                     Some(Temporal::Duration(DurationKind::YearMonth, count)) => {
-                        // Arrow counts the months of an interval in 32
-                        // bits and the engine counts them in 64, so the
-                        // far end of the range has nowhere to go.
-                        // Refusing it is the only honest answer;
-                        // wrapping would move the value by centuries.
-                        let count = i32::try_from(*count).map_err(|_| {
-                            Snag::Value(format!(
-                                "the duration at row {row} is {count} months, which is more than an Arrow interval holds"
-                            ))
-                        })?;
-                        Some(IntervalMonthDayNano::new(count, 0, 0))
+                        counts.push(*count);
+                        valid.push(true);
                     }
-                    _ => None,
-                });
+                    _ => {
+                        counts.push(0);
+                        valid.push(false);
+                    }
+                }
             }
-            Arc::new(months.into_iter().collect::<IntervalMonthDayNanoArray>())
+            Arc::new(IntervalMonthDayNanoArray::new(
+                ScalarBuffer::from(months(name, &counts)?),
+                Some(NullBuffer::from(valid)),
+            ))
         }
-        Kind::DayTime => Arc::new(
+        ColumnType::DayTime => Arc::new(
             temporals(values)
                 .map(|temporal| match temporal {
                     Some(Temporal::Duration(DurationKind::DayTime, nanos)) => Some(*nanos),
@@ -496,10 +511,10 @@ fn build(kind: &Kind, values: &[&Value], names: &Names) -> Result<ArrayRef, Snag
                 })
                 .collect::<DurationNanosecondArray>(),
         ),
-        Kind::Node => nodes(values, names)?,
-        Kind::Rel => rels(values, names)?,
-        Kind::Path => paths(values, names)?,
-        Kind::List(of) => {
+        ColumnType::Node => nodes(values, names)?,
+        ColumnType::Rel => rels(values, names)?,
+        ColumnType::Path => paths(name, values, names)?,
+        ColumnType::List(of) => {
             let mut offsets = Vec::with_capacity(values.len() + 1);
             let mut flat: Vec<&Value> = Vec::new();
             let mut valid = Vec::with_capacity(values.len());
@@ -514,15 +529,15 @@ fn build(kind: &Kind, values: &[&Value], names: &Names) -> Result<ArrayRef, Snag
                 offsets.push(flat.len() as i32);
             }
             Arc::new(ListArray::try_new(
-                item(of.data_type()),
+                item(data_type(name, of)?),
                 OffsetBuffer::new(offsets.into()),
-                build(of, &flat, names)?,
+                build(name, of, &flat, names)?,
                 Some(NullBuffer::from(valid)),
             )?)
         }
-        Kind::Record(fields) => {
+        ColumnType::Record(fields) => {
             let mut children: Vec<ArrayRef> = Vec::with_capacity(fields.len());
-            for (at, (_, kind)) in fields.iter().enumerate() {
+            for (at, (_, ty)) in fields.iter().enumerate() {
                 let column: Vec<&Value> = values
                     .iter()
                     .map(|value| match value {
@@ -530,16 +545,19 @@ fn build(kind: &Kind, values: &[&Value], names: &Names) -> Result<ArrayRef, Snag
                         _ => &Value::Null,
                     })
                     .collect();
-                children.push(build(kind, &column, names)?);
+                children.push(build(name, ty, &column, names)?);
             }
             Arc::new(StructArray::try_new(
-                match kind.data_type() {
+                match data_type(name, ty)? {
                     DataType::Struct(fields) => fields,
-                    _ => unreachable!("a record is a struct"),
+                    _ => return Err(mismatch(name, ty)),
                 },
                 children,
                 Some(present(values)),
             )?)
+        }
+        ColumnType::ZonedTime { .. } | ColumnType::Graph | ColumnType::BindingTable => {
+            return Err(unsupported(name, ty));
         }
     })
 }
@@ -651,15 +669,25 @@ fn tables<'a>(
 /// same thing without a union in the middle of it: the nodes in the
 /// order the walk visits them, the edges in the order it crosses them,
 /// and one more node than edge.
-fn paths(values: &[&Value], names: &Names) -> Result<ArrayRef, Snag> {
+fn paths(name: &str, values: &[&Value], names: &Names) -> Result<ArrayRef, Snag> {
     let mut node_offsets = vec![0i32];
     let mut rel_offsets = vec![0i32];
     let mut walked_nodes: Vec<&Value> = Vec::new();
     let mut walked_rels: Vec<&Value> = Vec::new();
-    for value in values {
-        if let Value::Path(elements) = value {
-            walked_nodes.extend(elements.iter().step_by(2));
-            walked_rels.extend(elements.iter().skip(1).step_by(2));
+    for (row, value) in values.iter().enumerate() {
+        match value {
+            Value::Path(elements) => {
+                walked_nodes.extend(elements.iter().step_by(2));
+                walked_rels.extend(elements.iter().skip(1).step_by(2));
+            }
+            // Never in a result: the executor settles a chain into its
+            // edges before the rows leave the pipeline.
+            Value::Chain(_) => {
+                return Err(Snag::Type(format!(
+                    "row {row} of column '{name}' is a path chain, which is internal to the executor"
+                )));
+            }
+            _ => {}
         }
         node_offsets.push(walked_nodes.len() as i32);
         rel_offsets.push(walked_rels.len() as i32);

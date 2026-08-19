@@ -206,6 +206,37 @@ def test_a_result_with_no_rows_still_has_its_columns(loaded: zudb.Connection) ->
     assert table.schema.field("uid").type == pa.null()
 
 
+@pytest.mark.parametrize(
+    "statement,arrow_type,answer",
+    [
+        ("UNWIND [1, null, 3] AS v RETURN v", pa.int64(), [1, None, 3]),
+        ("UNWIND [1.5, null, 3.5] AS v RETURN v", pa.float64(), [1.5, None, 3.5]),
+        ("UNWIND [true, null, false] AS v RETURN v", pa.bool_(), [True, None, False]),
+        ("UNWIND ['a', null, 'ccc'] AS v RETURN v", pa.string(), ["a", None, "ccc"]),
+    ],
+)
+def test_a_gap_in_a_column_is_a_gap_in_the_bitmap(
+    empty: zudb.Connection, statement: str, arrow_type: pa.DataType, answer: list
+) -> None:
+    # The values and the validity are two buffers, and a boolean column
+    # is the one where both of them are bits. A row that is null still
+    # occupies its cell in the values, which is what lets the column be
+    # handed over rather than rebuilt.
+    column = empty.execute(statement).to_arrow().column("v").combine_chunks()
+    assert column.type == arrow_type
+    assert column.null_count == 1
+    assert column.to_pylist() == answer
+
+
+def test_a_column_with_nothing_missing_carries_no_bitmap(empty: zudb.Connection) -> None:
+    # Absent rather than all ones, which is Arrow's own convention and
+    # the engine's: a reader of a column with nothing missing gets to
+    # skip the AND entirely.
+    column = empty.execute("UNWIND [1, 2, 3] AS v RETURN v").to_arrow().column("v")
+    assert column.null_count == 0
+    assert column.combine_chunks().buffers()[0] is None
+
+
 def test_the_batches_are_the_same_rows(tmp_path: Path) -> None:
     rows = 70_000
     zudb.load(tmp_path / "big.zu1", nodes="n", rels="r", columns={"uid": list(range(rows))})

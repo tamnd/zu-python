@@ -549,6 +549,10 @@ impl Result {
     /// The same data as `to_arrow`, handed over in batches of sixty-five
     /// thousand rows instead of as one table, which is what a consumer
     /// that writes as it reads wants.
+    ///
+    /// A batch is a view of the column it comes from rather than a copy
+    /// of it, and it is cut when the reader asks for it, so a consumer
+    /// that stops early stops paying.
     fn record_batches<'py>(slf: PyRef<'py, Self>) -> PyResult<Bound<'py, PyAny>> {
         let py = slf.py();
         needed(py, "pyarrow", "arrow")?
