@@ -214,9 +214,14 @@ jobs:
           python-version: "3.14"
       - uses: Swatinem/rust-cache@v2
       - run: sudo apt-get update && sudo apt-get install -y valgrind
-      # An ordinary build. Valgrind wants the instructions the extension
-      # actually ships, and an instrumented one would be a different
-      # program with a different allocator underneath it.
+      # The release build, with its symbols left on. Valgrind wants the
+      # instructions the extension actually ships, so this is the same
+      # optimised build and not an instrumented one, which would be a
+      # different program with a different allocator underneath it. What
+      # changes is only that the symbol table survives: a leak report
+      # whose every frame reads ??? says a number and nothing a person
+      # can act on, and the suppression file cannot name a function it
+      # has no name for.
       # Every optional dependency except polars, which starts a thread
       # pool the moment it is imported and holds a block of thread-local
       # state per worker for the life of the process. Valgrind reports
@@ -225,6 +230,9 @@ jobs:
       # and pyarrow stay because the README examples this suite runs go
       # through them.
       - run: pip install ".[pandas]" pytest ipython
+        env:
+          CARGO_PROFILE_RELEASE_STRIP: "false"
+          CARGO_PROFILE_RELEASE_DEBUG: "1"
       - name: A leak the job is meant to catch, caught
         run: |
           set +e

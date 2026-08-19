@@ -33,10 +33,17 @@
 # where it counts live zudb.Connection objects after a collection and
 # counts the process descriptors before and after a thousand cycles.
 #
-# The three rules after it are not general. Each one names a library
-# that leaks a fixed amount once, at import or at load, and each is here
+# The four rules after it are not general. Each one names a library that
+# leaks a fixed amount once, at import or at load, and each is here
 # because the leak has a name and a reason rather than because it was in
 # the way.
+#
+# Naming a function at all takes symbols, and the wheel a release ships
+# is stripped. The leaks job builds one that is not, which is the only
+# reason the rules below can say what they mean: a leak report whose
+# every frame reads ??? is a report nobody can act on, and a job that
+# produces one is a job that gets ignored on the week it finds
+# something.
 
 {
    the interpreter allocating for itself, shared, malloc
@@ -99,6 +106,22 @@
    match-leak-kinds: definite,possible
    ...
    fun:PyInit_readline
+}
+
+# pyo3 builds each class's member table as a Vec and hands CPython the
+# pointer, which is what tp_members is: an array the type holds for as
+# long as the type exists, and a type created at import exists until the
+# process ends. The Vec is leaked on purpose because freeing it would
+# leave the interpreter reading memory that had been handed back. One
+# record of eighty bytes, from the one class that has members rather
+# than getters, and it is in this extension's object file only because
+# pyo3 is compiled into it.
+{
+   pyo3 handing a type its member table
+   Memcheck:Leak
+   match-leak-kinds: definite,possible
+   ...
+   fun:*create_type_object*
 }
 
 # glibc grows the loader's namespace scope array on a dlopen and keeps
