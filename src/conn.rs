@@ -22,6 +22,7 @@ use crate::columns;
 use crate::error::{closed, programming, to_py_err};
 use crate::html;
 use crate::interrupt;
+use crate::numpy;
 use crate::plan;
 use crate::prepared::Prepared;
 use crate::register;
@@ -821,6 +822,31 @@ impl Result {
         let how = PyDict::new(py);
         how.set_item("types_mapper", pandas.getattr("ArrowDtype")?)?;
         Self::to_arrow(slf)?.call_method("to_pandas", (), Some(&how))
+    }
+
+    /// The columns as numpy arrays, in a dict keyed by column name.
+    ///
+    /// For the code that takes arrays rather than frames, and it needs
+    /// numpy and nothing else: the engine's own buffers are what numpy
+    /// wraps, so an integer, float, datetime or duration column is a
+    /// move rather than a copy and pyarrow never comes into it.
+    ///
+    /// A column with a null in it comes back as a
+    /// `numpy.ma.masked_array`, since numpy has no missing integer.
+    /// Strings, nodes, rels, paths, lists and records come back as
+    /// object arrays, which have somewhere to put a `None` and hold a
+    /// Python object per row like the rows themselves do. Dates are
+    /// `datetime64[D]`, datetimes `datetime64[ns]`, durations and times
+    /// of day `timedelta64[ns]`, the last of those being nanoseconds
+    /// since midnight, which is what a clock reading is on a number
+    /// line and is the closest thing numpy has to one.
+    ///
+    /// Reading it does not move the cursor `fetchone` uses, like every
+    /// other way of reading the columns: a caller who took a copy of
+    /// the result has not taken any of its rows.
+    fn fetchnumpy<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
+        needed(py, "numpy", "numpy")?;
+        numpy::arrays(py, &self.result, &self.names)
     }
 
     /// The rows as a `polars.DataFrame`.

@@ -477,6 +477,9 @@ class Result:
     def to_pandas(self) -> Any:
         """The rows as a `pandas.DataFrame`, with Arrow-backed dtypes."""
 
+    def fetchnumpy(self) -> dict[str, Any]:
+        """The columns as numpy arrays, in a dict keyed by column name."""
+
     def to_polars(self) -> Any:
         """The rows as a `polars.DataFrame`."""
 
