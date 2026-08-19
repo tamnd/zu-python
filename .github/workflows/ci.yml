@@ -38,6 +38,64 @@ jobs:
         env:
           PYO3_NO_PYTHON: 1
 
+  # What the public surface was, against what it is. Griffe reads the
+  # package the way a reader does, out of the .py files and the .pyi
+  # that declares the compiled half, and it names what moved, changed
+  # shape or went away. Nothing is built here on purpose: the declared
+  # API is what the stub says, so the stub is what gets compared, and a
+  # stub that has drifted from the extension is what the typing tests in
+  # the suite are for.
+  #
+  # A break is allowed. It has to be paid for with a version bump, which
+  # is the rule cargo semver-checks applies to the engine and the rule
+  # api-extractor's committed report applies to the TypeScript client:
+  # the change is fine, the change happening quietly is not. So this
+  # compares the version too and steps aside once it has moved, after
+  # printing what moved with it.
+  api:
+    runs-on: ubuntu-latest
+    steps:
+      # Griffe builds a worktree at the baseline, so it wants the ref
+      # and not just the one commit under test.
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.14"
+      - run: pip install griffe==2.2.0
+      # The gate is validated the only way a gate can be: a break has to
+      # fail it. Renaming a class the DB-API layer inherits from is the
+      # cheapest break that is unambiguously one, and the tree is put
+      # back before anything else looks at it.
+      - name: A break the gate is meant to catch, caught
+        env:
+          BASE_REF: ${{ github.base_ref }}
+        run: |
+          base="${BASE_REF:+origin/$BASE_REF}"
+          base="${base:-HEAD^}"
+          sed -i 's/^class DataError(/class DataErrorRenamed(/' python/zudb/errors.py
+          set +e
+          griffe check zudb -s python --against "$base"
+          rc=$?
+          set -e
+          git checkout -- python/zudb/errors.py
+          test $rc -ne 0 || { echo "the api gate did not fire on a removed name"; exit 1; }
+      - name: The surface, against what it was
+        env:
+          BASE_REF: ${{ github.base_ref }}
+        run: |
+          base="${BASE_REF:+origin/$BASE_REF}"
+          base="${base:-HEAD^}"
+          was=$(git show "$base:pyproject.toml" | sed -n 's/^version = "\(.*\)"/\1/p' | head -1)
+          now=$(sed -n 's/^version = "\(.*\)"/\1/p' pyproject.toml | head -1)
+          if [ "$was" != "$now" ]; then
+            echo "version moved from $was to $now, so a break here is one that was declared"
+            griffe check zudb -s python --against "$base" || true
+            exit 0
+          fi
+          griffe check zudb -s python --against "$base"
+
   test:
     strategy:
       fail-fast: false
