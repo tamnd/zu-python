@@ -14,6 +14,7 @@ does.
 
 from __future__ import annotations
 
+import os
 from pathlib import Path
 from typing import Any
 
@@ -24,6 +25,7 @@ pytest.importorskip("IPython")
 
 from IPython.core.error import UsageError  # noqa: E402
 from IPython.core.interactiveshell import InteractiveShell  # noqa: E402
+from zudb import magic  # noqa: E402
 
 
 @pytest.fixture
@@ -196,3 +198,40 @@ def test_a_statement_that_is_wrong_raises_what_it_would_have(shell: Any, tmp_pat
     shell.run_line_magic("gql", str(tmp_path / "wrong.zu1"))
     with pytest.raises(zudb.SyntaxError):
         gql(shell, "MATCH (p:person RETURN p")
+
+
+def test_a_path_with_a_space_in_it_is_quoted_and_opens(shell: Any, tmp_path: Path) -> None:
+    """Which is the reason the line is lexed rather than split on
+    whitespace, and the only reason."""
+    room = tmp_path / "two words"
+    room.mkdir()
+    path = room / "spaced.zu1"
+    conn = shell.run_line_magic("gql", f'"{path}"')
+    assert conn.closed is False
+    assert conn.execute("RETURN 1 AS n").fetchone() == (1,)
+
+
+@pytest.mark.skipif(os.name != "nt", reason="a backslash is only a separator on Windows")
+def test_a_windows_path_keeps_its_separators() -> None:
+    r"""The failure this is here for: `shlex.split` treats a backslash
+    as an escape, so `C:\data\social.zu1` came out of it as
+    `C:datasocial.zu1` and the magic then said the system could not
+    find a file the person could see in front of them."""
+    assert magic.words(r"--read-only C:\data\social.zu1") == [
+        "--read-only",
+        r"C:\data\social.zu1",
+    ]
+
+
+@pytest.mark.skipif(os.name == "nt", reason="a backslash is an escape everywhere else")
+def test_a_backslash_is_still_an_escape_where_a_shell_says_it_is() -> None:
+    """Nothing is taken away from the platforms that were right: a
+    person on a Unix quotes a space with a backslash and expects that
+    to go on working."""
+    assert magic.words(r"/tmp/two\ words/spaced.zu1") == ["/tmp/two words/spaced.zu1"]
+
+
+def test_a_hash_in_a_name_is_a_name_and_not_a_comment() -> None:
+    """A line magic is not a script, and `#` is a legal character in a
+    file name on every platform this runs on."""
+    assert magic.words("a#b.zu1 --read-only") == ["a#b.zu1", "--read-only"]

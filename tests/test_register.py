@@ -319,6 +319,7 @@ def test_a_closed_connection_registers_nothing(empty: zudb.Connection) -> None:
         empty.register("people", {"a": [1]})
 
 
+@pytest.mark.timing
 def test_registering_costs_the_same_whatever_the_frame_holds(empty: zudb.Connection) -> None:
     """Nothing is copied, so nothing about the call is per row.
 

@@ -74,6 +74,14 @@ addopts = "-q"
 # holds `conformance`, which is a development tool rather than something
 # the wheel ships.
 pythonpath = ["tools", "."]
+# Tests that assert on a wall clock: that two connections overlap, that
+# an interrupt is felt inside a budget, that appending beats inserting
+# by a margin. They are the tests that say this client is fast, and
+# they are meaningless under a sanitizer, which makes every instruction
+# slower by a factor nobody controls and the two sides of a ratio
+# slower by different ones. The jobs that run under one deselect them
+# by this marker and the ordinary jobs run them all.
+markers = ["timing: asserts on elapsed time, so a sanitizer run has to skip it"]
 
 [tool.ruff]
 target-version = "py311"

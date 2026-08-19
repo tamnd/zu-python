@@ -243,6 +243,7 @@ def test_polars_reads_the_same_rows(loaded: zudb.Connection) -> None:
     assert frame["name"].to_list() == ["ada", "grace", "kay"]
 
 
+@pytest.mark.timing
 def test_python_keeps_running_while_a_result_becomes_arrow(tmp_path: Path) -> None:
     rows = 400_000
     zudb.load(

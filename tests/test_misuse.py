@@ -1,6 +1,6 @@
 """Deliberately wrong programs, and what each of them is told.
 
-DX2 asks for a misuse suite in both clients: no crash, no leak, and a
+DX3 asks for a misuse suite in every client: no crash, no leak, and a
 clear error for every program that is wrong on purpose. Clear is the
 hard word of the three, so it is spelled out here as three things a
 message has to do. It names the thing the caller named, being the file
@@ -19,10 +19,18 @@ there: both are a path that does not lead to a database, and telling a
 caller who mistyped one to file a bug would be the wrong answer twice.
 
 No crash is the suite running at all. No leak is checked from outside
-the call that would cause one, twice: every case is followed by a read
-on the connection it was aimed at, and the failing connects are
+the call that would cause one, three ways: every case is followed by a
+read on the connection it was aimed at, the failing connects are
 repeated five hundred times, which is past the descriptor limit a
-process starts with.
+process starts with, and the descriptors themselves are counted where
+the operating system will say.
+
+The lifecycle tests are the second half DX3 asks for. A misuse suite
+watches what a wrong program is told; a lifecycle suite watches what a
+right program leaves behind, which is the failure nobody sees until the
+loop has run for a week. Opened and closed, opened and dropped, closed
+with something still open on it: each of the three is counted rather
+than described.
 
 The last two tests are the half of a misuse suite that is usually
 missing. The programs that look wrong and are not, each of which is a
@@ -133,6 +141,12 @@ MISUSES: tuple[Misuse, ...] = (
         lambda conn, tmp: conn.execute("RETURN $x AS x", {"x": object()}),
         TypeError,
         ("a parameter cannot be a object", "zu holds"),
+    ),
+    Misuse(
+        "passes a parameter that contains itself",
+        lambda conn, tmp: conn.execute("RETURN $x AS x", {"x": knot()}),
+        ValueError,
+        ("nests deeper than 64", "contains itself"),
     ),
     Misuse(
         "passes the parameters as a list",
@@ -247,6 +261,14 @@ MISUSES: tuple[Misuse, ...] = (
 )
 
 
+def knot() -> dict[str, object]:
+    """A dict that holds itself, which is the value a conversion written
+    the obvious way walks until the stack runs out."""
+    tied: dict[str, object] = {}
+    tied["self"] = tied
+    return tied
+
+
 def closed_appender(conn: zudb.Connection) -> zudb.Appender:
     """An appender that has been closed, which is the state a `with`
     block leaves one in."""
@@ -332,6 +354,131 @@ def test_five_hundred_failed_connections_leave_nothing_open(tmp_path: Path) -> N
     assert alive == []
 
 
+def descriptors() -> int | None:
+    """How many files this process has open, or `None` where the
+    operating system will not say.
+
+    Linux and macOS both keep the answer in a directory, at different
+    paths, and Windows keeps it nowhere a process can read. A count is
+    not a leak detector on its own, which is why what the tests below
+    compare is the count before a thousand cycles against the count
+    after.
+    """
+    for where in ("/proc/self/fd", "/dev/fd"):
+        if Path(where).is_dir():
+            return len(list(Path(where).iterdir()))
+    return None
+
+
+def test_a_thousand_connections_opened_and_closed_leave_nothing_behind(
+    tmp_path: Path,
+) -> None:
+    """The loop a job runs, a thousand times.
+
+    A descriptor kept per connection is a program that works in a
+    notebook and dies overnight, and it is invisible until the count is
+    taken from outside. Eight paths rather than a thousand, because what
+    is being counted is connections and not files, and reopening the
+    same database is the shape a job actually has.
+    """
+    before = descriptors()
+
+    for step in range(1000):
+        conn = zudb.connect(tmp_path / f"cycle{step % 8}.zu1")
+        conn.execute("INSERT (p:person {uid: 1, name: 'ada'})")
+        conn.close()
+
+    gc.collect()
+    if before is not None:
+        assert descriptors() == before
+
+    # And nothing is holding one open behind the collector's back.
+    alive = [obj for obj in gc.get_objects() if isinstance(obj, zudb.Connection)]
+    assert alive == []
+
+
+def test_a_thousand_connections_dropped_rather_than_closed_leave_nothing_behind(
+    tmp_path: Path,
+) -> None:
+    """The same loop written by somebody who never calls `close`.
+
+    Which is most people most of the time, so the collector taking a
+    connection has to release the file the way `close` does. A client
+    where only the explicit path is clean is a client that leaks for
+    every caller who used a `for` loop and trusted the language.
+    """
+    before = descriptors()
+
+    for step in range(1000):
+        conn = zudb.connect(tmp_path / f"dropped{step % 8}.zu1")
+        del conn
+
+    gc.collect()
+    if before is not None:
+        assert descriptors() == before
+
+
+def test_a_connection_closed_with_things_open_on_it_closes_them_too(
+    tmp_path: Path,
+) -> None:
+    """Close is the one call a caller makes in a `finally`, so it has to
+    work from every state rather than from the tidy one.
+
+    An appender with rows in it and a transaction that never ended are
+    the two things that can be open when it arrives. Neither may hold
+    the file after, and neither may fail the close: a cleanup path that
+    raises is a cleanup path that hides the error it was cleaning up
+    after.
+    """
+    before = descriptors()
+
+    conn = zudb.connect(tmp_path / "open.zu1")
+    conn.execute("INSERT (p:person {uid: 1, name: 'ada'})")
+    rows = conn.appender("person")
+    rows.append_row([2, "grace"])
+    txn = conn.transaction()
+    txn.__enter__()
+    assert conn.in_transaction
+
+    conn.close()
+    assert conn.closed
+
+    # Both say so rather than reaching through a connection that is
+    # gone, which is the difference between a message and a segfault.
+    # Caught with `except` rather than with `pytest.raises`, because the
+    # traceback that one keeps holds the appender alive past the `del`
+    # below and its warning would then land in whatever test ran next.
+    try:
+        rows.append_row([3, "kay"])
+    except zudb.ProgrammingError:
+        pass
+    else:
+        pytest.fail("appending through a closed connection returned normally")
+
+    try:
+        txn.commit()
+    except zudb.ProgrammingError:
+        pass
+    else:
+        pytest.fail("committing through a closed connection returned normally")
+
+    # The rows that were buffered went nowhere, which is worth the
+    # warning it gets: the close was the caller's, and what it threw
+    # away was the caller's too.
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        del rows, txn
+        gc.collect()
+    assert [warning.category for warning in caught] == [ResourceWarning]
+
+    if before is not None:
+        assert descriptors() == before
+
+    # And the database is a database, opened again by somebody else.
+    with zudb.connect(tmp_path / "open.zu1") as conn:
+        assert conn.execute(READ).fetchall() == [(1,)]
+
+
 def test_a_statement_that_failed_wrote_nothing_and_left_the_connection_alone(
     social: zudb.Connection,
 ) -> None:
@@ -362,6 +509,14 @@ def test_the_programs_that_look_like_misuse_and_are_not(
     # reasonable, and refusing it would make the dict the union of what
     # every statement wants.
     assert len(social.execute(READ, {"unread": 1}).fetchall()) == 3
+
+    # A value nested deeply is not a value nested endlessly. The limit
+    # that catches a cycle sits where nothing anybody wrote reaches, so
+    # a list forty deep goes through and comes back.
+    deep: object = 1
+    for _ in range(40):
+        deep = [deep]
+    assert social.execute("RETURN $x AS x", {"x": deep}).fetchall()[0][0] is not None
 
     # A label nothing carries matches nothing. A pattern with no answer
     # is the ordinary answer to a question about a graph, and the other

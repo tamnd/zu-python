@@ -478,6 +478,27 @@ fn zone_of(py: Python<'_>, offset: i16) -> PyResult<Bound<'_, PyTzInfo>> {
 /// number against its own spelling would answer nothing and say
 /// nothing.
 pub fn from_py(value: &Bound<'_, PyAny>) -> PyResult<Value> {
+    nested(value, 0)
+}
+
+/// How deep a parameter may nest before this stops reading it.
+///
+/// A list of lists of records is a value somebody meant to send, and a
+/// value that contains itself is a call that would otherwise walk until
+/// the stack ran out and take the interpreter with it, which it does
+/// here rather than in Python and so arrives as a segfault instead of a
+/// `RecursionError`. There is no depth between the two that anybody
+/// writes on purpose, so the limit is set where a real value never
+/// reaches and a cycle always does.
+const DEEP: usize = 64;
+
+fn nested(value: &Bound<'_, PyAny>, depth: usize) -> PyResult<Value> {
+    if depth > DEEP {
+        return Err(pyo3::exceptions::PyValueError::new_err(format!(
+            "a parameter nests deeper than {DEEP}, which is what a value that contains itself \
+             looks like"
+        )));
+    }
     if value.is_none() {
         return Ok(Value::Null);
     }
@@ -531,7 +552,7 @@ pub fn from_py(value: &Bound<'_, PyAny>) -> PyResult<Value> {
         return Ok(Value::List(
             items
                 .iter()
-                .map(|item| from_py(&item))
+                .map(|item| nested(&item, depth + 1))
                 .collect::<PyResult<_>>()?,
         ));
     }
@@ -539,14 +560,14 @@ pub fn from_py(value: &Bound<'_, PyAny>) -> PyResult<Value> {
         return Ok(Value::List(
             items
                 .iter()
-                .map(|item| from_py(&item))
+                .map(|item| nested(&item, depth + 1))
                 .collect::<PyResult<_>>()?,
         ));
     }
     if let Ok(fields) = value.cast::<PyDict>() {
         let mut out = Vec::with_capacity(fields.len());
         for (name, item) in fields.iter() {
-            out.push((name.extract::<String>()?, from_py(&item)?));
+            out.push((name.extract::<String>()?, nested(&item, depth + 1)?));
         }
         return Ok(Value::record(out));
     }

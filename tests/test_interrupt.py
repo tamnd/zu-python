@@ -14,8 +14,10 @@ keyboard is a kernel somebody kills.
 
 from __future__ import annotations
 
+import _thread
 import os
 import signal
+import sys
 import threading
 import time
 
@@ -35,6 +37,40 @@ BUDGET = 0.05
 SETTLED = 0.2
 
 
+def press() -> None:
+    """`Ctrl-C`, from inside the process that is going to feel it.
+
+    Everywhere but Windows that is the signal a terminal sends, sent the
+    way a terminal sends it: to this process, for the main thread to
+    answer.
+
+    Windows has no way to send one process a SIGINT. `os.kill` there is
+    `TerminateProcess` for every signal except the two console events,
+    so `os.kill(os.getpid(), SIGINT)` does not deliver a press, it kills
+    the process, which is what it had been doing to this suite on every
+    Windows run: five lines of dots and an exit code, no failure and no
+    summary, because there was no interpreter left to write one. The two
+    console events are no better, since a console event goes to every
+    process attached to the console and on a build machine that is the
+    build.
+
+    So Windows presses the key the way CPython's own console handler
+    does when a real press arrives: `PyErr_SetInterrupt`, which
+    `_thread.interrupt_main` is the spelling of. What that leaves
+    uncovered is one hop, from the operating system into the C runtime,
+    and nothing running inside this process can cover that hop without
+    taking the process with it. Everything after the hop is the same on
+    both platforms and is all of the code this repository wrote: a
+    tripped SIGINT, a statement deep in the executor, and the next
+    `PyErr_CheckSignals` turning one into a `KeyboardInterrupt` on the
+    main thread inside the budget.
+    """
+    if sys.platform == "win32":
+        _thread.interrupt_main()
+    else:
+        os.kill(os.getpid(), signal.SIGINT)
+
+
 def after(delay: float, do) -> threading.Thread:
     """Runs `do` on a thread of its own, `delay` from now, and answers
     the thread so a test can join it."""
@@ -48,16 +84,15 @@ def after(delay: float, do) -> threading.Thread:
     return thread
 
 
+@pytest.mark.timing
 def test_a_press_raises_keyboard_interrupt_within_the_budget(throng: zudb.Connection) -> None:
     pressed: list[float] = []
 
-    def press() -> None:
+    def timed_press() -> None:
         pressed.append(time.perf_counter())
-        # The signal a terminal sends, sent the way a terminal sends it:
-        # to the process, for the main thread to answer.
-        os.kill(os.getpid(), signal.SIGINT)
+        press()
 
-    presser = after(SETTLED, press)
+    presser = after(SETTLED, timed_press)
     with pytest.raises(KeyboardInterrupt):
         throng.execute(WORK)
     felt = time.perf_counter()
@@ -66,7 +101,7 @@ def test_a_press_raises_keyboard_interrupt_within_the_budget(throng: zudb.Connec
 
 
 def test_the_connection_is_the_same_afterwards(throng: zudb.Connection) -> None:
-    presser = after(SETTLED, lambda: os.kill(os.getpid(), signal.SIGINT))
+    presser = after(SETTLED, press)
     with pytest.raises(KeyboardInterrupt):
         throng.execute(WORK)
     presser.join(timeout=30)
@@ -76,6 +111,7 @@ def test_the_connection_is_the_same_afterwards(throng: zudb.Connection) -> None:
     assert throng.execute("MATCH (p:person) RETURN count(p) AS n").fetchone() == (12_000,)
 
 
+@pytest.mark.timing
 def test_interrupt_stops_a_statement_from_another_thread(throng: zudb.Connection) -> None:
     asked: list[float] = []
 
@@ -123,7 +159,7 @@ def test_an_ask_with_nothing_running_does_not_end_the_next_statement(
 
 def test_a_press_with_nothing_running_is_pythons_to_deliver(social: zudb.Connection) -> None:
     with pytest.raises(KeyboardInterrupt):
-        os.kill(os.getpid(), signal.SIGINT)
+        press()
         # Python raises the press at the next thing this thread does,
         # which is this call, and the statement it stopped is none.
         for _ in range(1000):
@@ -137,6 +173,7 @@ def test_interrupt_on_a_closed_connection_says_so(social: zudb.Connection) -> No
         social.interrupt()
 
 
+@pytest.mark.timing
 def test_a_connection_answers_while_it_is_busy(throng: zudb.Connection) -> None:
     """Asking a connection how it is going does not queue behind the
     statement it is going through."""
@@ -165,6 +202,7 @@ def test_rows_read_holds_what_the_last_statement_cost(social: zudb.Connection) -
     assert social.rows_read >= 3
 
 
+@pytest.mark.timing
 def test_a_statement_that_finishes_is_not_slowed_by_being_watched(social: zudb.Connection) -> None:
     """The thread a statement runs on is kept rather than made, so a
     small statement on the main thread costs about what it costs on any
@@ -198,7 +236,7 @@ def test_a_press_during_a_statement_that_finishes_first_is_still_raised(
     """A press is never swallowed. The statement was over before it
     arrived, so Python raises it at the next thing this thread does."""
     with pytest.raises(KeyboardInterrupt):
-        os.kill(os.getpid(), signal.SIGINT)
+        press()
         social.execute("MATCH (p:person) RETURN p.name AS n")
         for _ in range(1000):
             pass

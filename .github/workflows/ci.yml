@@ -38,6 +38,64 @@ jobs:
         env:
           PYO3_NO_PYTHON: 1
 
+  # What the public surface was, against what it is. Griffe reads the
+  # package the way a reader does, out of the .py files and the .pyi
+  # that declares the compiled half, and it names what moved, changed
+  # shape or went away. Nothing is built here on purpose: the declared
+  # API is what the stub says, so the stub is what gets compared, and a
+  # stub that has drifted from the extension is what the typing tests in
+  # the suite are for.
+  #
+  # A break is allowed. It has to be paid for with a version bump, which
+  # is the rule cargo semver-checks applies to the engine and the rule
+  # api-extractor's committed report applies to the TypeScript client:
+  # the change is fine, the change happening quietly is not. So this
+  # compares the version too and steps aside once it has moved, after
+  # printing what moved with it.
+  api:
+    runs-on: ubuntu-latest
+    steps:
+      # Griffe builds a worktree at the baseline, so it wants the ref
+      # and not just the one commit under test.
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.14"
+      - run: pip install griffe==2.2.0
+      # The gate is validated the only way a gate can be: a break has to
+      # fail it. Renaming a class the DB-API layer inherits from is the
+      # cheapest break that is unambiguously one, and the tree is put
+      # back before anything else looks at it.
+      - name: A break the gate is meant to catch, caught
+        env:
+          BASE_REF: ${{ github.base_ref }}
+        run: |
+          base="${BASE_REF:+origin/$BASE_REF}"
+          base="${base:-HEAD^}"
+          sed -i 's/^class DataError(/class DataErrorRenamed(/' python/zudb/errors.py
+          set +e
+          griffe check zudb -s python --against "$base"
+          rc=$?
+          set -e
+          git checkout -- python/zudb/errors.py
+          test $rc -ne 0 || { echo "the api gate did not fire on a removed name"; exit 1; }
+      - name: The surface, against what it was
+        env:
+          BASE_REF: ${{ github.base_ref }}
+        run: |
+          base="${BASE_REF:+origin/$BASE_REF}"
+          base="${base:-HEAD^}"
+          was=$(git show "$base:pyproject.toml" | sed -n 's/^version = "\(.*\)"/\1/p' | head -1)
+          now=$(sed -n 's/^version = "\(.*\)"/\1/p' pyproject.toml | head -1)
+          if [ "$was" != "$now" ]; then
+            echo "version moved from $was to $now, so a break here is one that was declared"
+            griffe check zudb -s python --against "$base" || true
+            exit 0
+          fi
+          griffe check zudb -s python --against "$base"
+
   test:
     strategy:
       fail-fast: false
@@ -61,6 +119,157 @@ jobs:
       # checkout it was built from.
       - run: pip install pytest griffe ipython
       - run: pytest
+
+  # The same suite again, over an extension built with AddressSanitizer.
+  #
+  # There is no `unsafe` in this crate, which is the reason to run this
+  # rather than the reason not to: what a binding gets wrong is not
+  # arithmetic on a raw pointer but a buffer read after the object that
+  # owned it was collected, or an engine allocation freed on one side of
+  # the boundary and touched from the other. Neither is an `unsafe`
+  # block here and both are a use-after-free.
+  #
+  # ASan's runtime has to be loaded before anything it instruments, and
+  # the extension is opened by `import` long after python has started,
+  # so it is preloaded rather than linked: `-Zexternal-clangrt` tells
+  # rustc not to bundle its own copy and LD_PRELOAD supplies clang's.
+  # `--target` is what keeps the flags off the build scripts, which are
+  # host programs with no runtime preloaded and would not link.
+  # Leak detection is off, because LSan reports the interpreter's own
+  # hundred one-time allocations and cannot be told to stop; the job
+  # below is where leaks are counted, with a tool that can.
+  sanitizer:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.14"
+      - uses: Swatinem/rust-cache@v2
+      # The instrumented build is nightly, because `-Zsanitizer` is, and
+      # it is the only thing here that is: what ships is built by the
+      # pinned compiler in every other job.
+      - run: rustup toolchain install nightly --profile minimal
+      - run: sudo apt-get update && sudo apt-get install -y libclang-rt-18-dev
+      # pandas and pyarrow by name rather than through the extra that
+      # names them, because installing the extra would build this
+      # extension from source to get at its metadata and this job builds
+      # its own a step later. They are here at all because two of the
+      # whole programs the README publishes call to_pandas, and a job
+      # that skipped them would be watching a smaller suite than the
+      # one it claims to watch.
+      - run: pip install maturin pytest ipython pandas pyarrow
+      - name: The extension, instrumented
+        env:
+          RUSTUP_TOOLCHAIN: nightly
+          RUSTFLAGS: -Zsanitizer=address -Zexternal-clangrt
+          CC: clang
+          CXX: clang++
+        run: |
+          maturin build --target x86_64-unknown-linux-gnu --out dist
+          pip install --force-reinstall --no-deps dist/*.whl
+      - name: The suite, watched
+        run: |
+          runtime=$(clang -print-file-name=libclang_rt.asan-$(uname -m).so)
+          test -f "$runtime"
+          LD_PRELOAD="$runtime" ASAN_OPTIONS=detect_leaks=0:abort_on_error=1 \
+            pytest -m "not timing"
+
+  # The third tool over the same suite, and the one that watches what
+  # the sanitizer cannot. ASan instruments the source it compiles, so it
+  # sees nothing the interpreter does with the memory it hands the
+  # extension; Valgrind instruments the instructions that run, so both
+  # sides of the boundary are watched and so is every prebuilt thing
+  # either of them links. It also reports a read of memory nobody wrote,
+  # which ASan does not look for at all.
+  #
+  # PYTHONMALLOC=malloc is what makes this readable. CPython pools small
+  # objects behind its own allocator by default, so every allocation
+  # this extension makes through the interpreter would arrive as one
+  # 256KB arena and nothing inside it could be attributed to anybody.
+  #
+  # tools/valgrind.supp is one rule and says what it leaves out. The
+  # gate is validated the only way a gate can be: a deliberate leak
+  # through ctypes fails it.
+  #
+  # Definite leaks and not possible ones, which is the same pair of
+  # flags the TypeScript client's job carries and for a sharper reason
+  # here. Over the whole suite this counts 420 possible losses and zero
+  # definite ones, and 417 of the 420 are pyarrow registering compute
+  # kernels into a static table it never tears down. A possible loss is
+  # a block whose only surviving pointer is into its middle, which is
+  # what a registry of C++ objects looks like from the outside and what
+  # almost nothing this extension allocates looks like. Counting them
+  # would mean either a red job or a suppression naming pyarrow, and
+  # naming a dependency in a suppression file is how a suppression file
+  # starts growing. What it costs is a Rust leak that happens to leave
+  # an interior pointer behind, and the suite counts live connections
+  # and process descriptors from the other side for that.
+  leaks:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.14"
+      - uses: Swatinem/rust-cache@v2
+      - run: sudo apt-get update && sudo apt-get install -y valgrind
+      # The release build, with its symbols left on. Valgrind wants the
+      # instructions the extension actually ships, so this is the same
+      # optimised build and not an instrumented one, which would be a
+      # different program with a different allocator underneath it. What
+      # changes is only that the symbol table survives: a leak report
+      # whose every frame reads ??? says a number and nothing a person
+      # can act on, and the suppression file cannot name a function it
+      # has no name for.
+      #
+      # Three settings and not one, because two things strip this wheel
+      # and only one of them is cargo. `strip = true` in pyproject.toml
+      # is maturin's own, applied after the build and to the artifact
+      # rather than through the profile, so a cargo profile that says to
+      # keep the symbols is a cargo profile maturin then throws away.
+      # That is what happened the first time this job ran the suite: one
+      # eighty byte record out of pyo3's type constructor, named in the
+      # suppression file, reported with ??? on every frame and matched
+      # by nothing.
+      #
+      # Every optional dependency except polars, which starts a thread
+      # pool the moment it is imported and holds a block of thread-local
+      # state per worker for the life of the process. Valgrind reports
+      # all of it and none of it belongs to this client, and the one
+      # test that wants polars skips itself when it is missing. Pandas
+      # and pyarrow stay because the README examples this suite runs go
+      # through them.
+      - run: pip install ".[pandas]" pytest ipython
+        env:
+          MATURIN_STRIP: "false"
+          CARGO_PROFILE_RELEASE_STRIP: "false"
+          CARGO_PROFILE_RELEASE_DEBUG: "1"
+      # Said here rather than trusted, because the whole job rests on it
+      # and the way it fails is an hour of valgrind followed by a report
+      # nobody can read. The section is what valgrind reads a frame's
+      # name out of, and a stripped object has neither it nor a symbol
+      # table to fall back on.
+      - name: The symbols the report is read with
+        run: |
+          set -eu
+          so=$(python -c 'import zudb, pathlib; print(pathlib.Path(zudb.__file__).parent / "_zudb.abi3.so")')
+          readelf -S "$so" | grep -q debug_info \
+            || { echo "$so carries no debug info, so every frame of the report would read ???"; exit 1; }
+      - name: A leak the job is meant to catch, caught
+        run: |
+          set +e
+          PYTHONMALLOC=malloc valgrind --error-exitcode=1 --leak-check=full \
+            --show-leak-kinds=definite --errors-for-leak-kinds=definite \
+            --suppressions=tools/valgrind.supp -q \
+            python -c 'import ctypes; ctypes.CDLL("libc.so.6").malloc(4096)'
+          test $? -eq 1 || { echo "the leak gate did not fire on a leak"; exit 1; }
+      - name: The suite, counted
+        run: |
+          PYTHONMALLOC=malloc valgrind --error-exitcode=1 --leak-check=full \
+            --show-leak-kinds=definite --errors-for-leak-kinds=definite \
+            --suppressions=tools/valgrind.supp -q \
+            python -m pytest -m "not timing"
 
   # The shared corpus, which is the same 945 cases the engine runs
   # against itself and the eight other clients run against theirs. It is
