@@ -1,0 +1,164 @@
+name: Install
+
+# `pip install zudb`, on a machine that has nothing else on it.
+#
+# Every other job in this repository runs on a hosted image, and a
+# hosted image is the least representative computer in the world: it
+# has a compiler, a Rust toolchain, a git, a Python built by somebody
+# who knew what was going to be built against it, and a hundred
+# libraries that a wheel can quietly link to and get away with. The
+# failures that only a user's machine sees are the ones nothing here
+# looks for. A file left out of the wheel and read out of the checkout
+# instead. A stub or a py.typed that the sdist has and the wheel does
+# not. An extension linked against a symbol version the build image had
+# and a slim image has not. A dependency that arrived because something
+# else in the job had pulled it in.
+#
+# So this builds the wheel the release would build and installs it in a
+# container that holds an interpreter, a package manager and nothing
+# else, with the index turned off so that nothing can arrive to cover
+# for a mistake. tools/smoke.py is the program it runs there: standard
+# library only, no pytest, no fixtures, no checkout.
+#
+# Nightly rather than on every push, because what it catches is drift
+# in things outside this repository. A base image whose glibc moved, a
+# manylinux policy that went forward, a pip that changed how it reads a
+# tag. None of that is in a diff anybody here writes, and all of it
+# arrives on its own schedule.
+
+on:
+  schedule:
+    # Late enough that the day's merges are in, and not on the hour,
+    # where every scheduled job on the service is queued behind every
+    # other one.
+    - cron: "23 5 * * *"
+  workflow_dispatch:
+  # The workflow and the program it runs are exercised on the pull
+  # request that changes them, since a nightly that broke is a nightly
+  # nobody reads for a week.
+  pull_request:
+    paths:
+      - .github/workflows/install.yml
+      - tools/smoke.py
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  # The two Linux wheels that a container can install, built the way the
+  # release builds them: inside the pypa images, against the oldest
+  # interpreter the stable ABI covers. Release and not debug, because
+  # what is being installed has to be what would be published, and a
+  # debug extension is a different program with different link edges.
+  wheel:
+    name: ${{ matrix.libc }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - libc: manylinux
+            manylinux: "2_28"
+            image: quay.io/pypa/manylinux_2_28_x86_64
+          - libc: musllinux
+            manylinux: musllinux_1_2
+            image: quay.io/pypa/musllinux_1_2_x86_64
+    steps:
+      - uses: actions/checkout@v7
+      - uses: PyO3/maturin-action@v1
+        with:
+          target: x86_64
+          manylinux: ${{ matrix.manylinux }}
+          container: ${{ matrix.image }}
+          # Named rather than left to the toolchain file, which the
+          # build container does not read.
+          rust-toolchain: 1.97.1
+          args: --release --out dist -i /opt/python/cp311-cp311/bin/python
+          # A shared object cannot have a static C runtime linked into
+          # it, which is the musl default and a no-op everywhere else.
+          before-script-linux: |
+            export RUSTFLAGS="-C target-feature=-crt-static"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wheel-${{ matrix.libc }}
+          path: dist/*.whl
+          if-no-files-found: error
+
+  # And the install, in a container that is the whole point of the job.
+  #
+  # docker run rather than a job container, because a job container has
+  # the runner's own Node mounted into it and half the reason to use a
+  # slim image is that nothing is mounted into it. This way the only
+  # things inside are the image, one wheel and one file.
+  #
+  # Three rows: the floor this package supports, the newest release, and
+  # musl, which is the platform where a wheel that was tagged wrongly
+  # installs anyway and then fails to import.
+  clean:
+    name: ${{ matrix.image }}
+    needs: wheel
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - image: python:3.11-slim
+            wheel: manylinux
+          - image: python:3.14-slim
+            wheel: manylinux
+          - image: python:3.14-alpine
+            wheel: musllinux
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/download-artifact@v4
+        with:
+          name: wheel-${{ matrix.wheel }}
+          path: dist
+      - name: An install, on a machine with only the language runtime
+        run: |
+          docker run --rm \
+            -v "$PWD/dist:/dist:ro" \
+            -v "$PWD/tools/smoke.py:/smoke.py:ro" \
+            -w /tmp \
+            ${{ matrix.image }} sh -c '
+              set -eu
+              # What the image is claimed to be, checked rather than
+              # believed, because the day a base image starts shipping a
+              # compiler is the day this job silently stops being about
+              # anything.
+              for tool in cc gcc clang rustc cargo make git; do
+                if command -v "$tool" >/dev/null 2>&1; then
+                  echo "this image has $tool on it, so it is not the machine this job is about"
+                  exit 1
+                fi
+              done
+              # --no-index is what makes the install a test. Without it
+              # a wheel that failed to build would be papered over by
+              # whatever the index has, and a dependency that crept in
+              # would arrive rather than fail.
+              python -m pip install --no-index --find-links /dist zudb
+              python -m pip check
+              python /smoke.py
+            '
+      # The gate is validated the only way a gate can be: the failure it
+      # exists to catch has to fail it. The same program in the same
+      # image with nothing installed, which is what a wheel that did not
+      # build, did not upload or did not install looks like from in
+      # here. It is also the check that this job is running the program
+      # at all, since a bind mount pointing at nothing and a container
+      # whose exit code went nowhere both look exactly like success.
+      - name: The failure the job is meant to catch, caught
+        run: |
+          set +e
+          docker run --rm \
+            -v "$PWD/tools/smoke.py:/smoke.py:ro" \
+            -w /tmp \
+            ${{ matrix.image }} python /smoke.py
+          test $? -ne 0 || { echo "the smoke program passed without zudb installed"; exit 1; }
