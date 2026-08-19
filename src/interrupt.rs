@@ -369,7 +369,7 @@ thread_local! {
 /// the limited ABI these wheels are built against does not expose the
 /// second one, and asking Python is a couple of attribute lookups on a
 /// module that is imported long before anything here runs.
-fn on_main_thread(py: Python<'_>) -> bool {
+pub(crate) fn on_main_thread(py: Python<'_>) -> bool {
     IS_MAIN.with(|known| {
         if let Some(known) = known.get() {
             return known;

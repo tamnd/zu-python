@@ -24,6 +24,7 @@ mod load;
 mod plan;
 mod prepared;
 mod register;
+mod stream;
 mod txn;
 mod value;
 
@@ -62,6 +63,9 @@ fn _zudb(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_class::<conn::Result>()?;
     module.add_class::<appender::Appender>()?;
     module.add_class::<prepared::Prepared>()?;
+    module.add_class::<stream::Stream>()?;
+    module.add_class::<stream::StreamBatches>()?;
+    module.add_class::<stream::StreamSummary>()?;
     module.add_class::<plan::Plan>()?;
     module.add_class::<plan::PlanNode>()?;
     module.add_class::<plan::ScalarPlan>()?;

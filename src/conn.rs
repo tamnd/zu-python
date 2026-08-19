@@ -25,6 +25,7 @@ use crate::interrupt;
 use crate::plan;
 use crate::prepared::Prepared;
 use crate::register;
+use crate::stream;
 use crate::txn::Transaction;
 use crate::value::{Names, from_py, to_py};
 
@@ -81,6 +82,12 @@ pub struct Connection {
     /// asking it to stop, should not queue behind a ten second
     /// statement.
     alive: AtomicBool,
+    /// The stream holding the connection, if one is. A stream ends when
+    /// its reader says so, and a statement that queued behind a
+    /// half-read one would be waiting for a loop that is waiting for
+    /// it, so every other statement asks this and is told no rather
+    /// than left to deadlock.
+    pub(crate) feeding: Arc<stream::Feeding>,
     #[pyo3(get)]
     path: PathBuf,
     #[pyo3(get)]
@@ -115,6 +122,49 @@ impl Connection {
         params: Option<&Bound<'_, PyDict>>,
     ) -> PyResult<Result> {
         self.execute(py, statement, params)
+    }
+
+    /// Runs one statement and hands back its rows a batch at a time, as
+    /// the executor makes them.
+    ///
+    /// ```python
+    /// with conn.stream("MATCH (p:person) RETURN p.name AS name") as rows:
+    ///     for (name,) in rows:
+    ///         print(name)
+    /// ```
+    ///
+    /// What is in memory is a batch and not the answer, which is what
+    /// this is for: a statement over ten million rows read by a program
+    /// holding a thousand. A reader that stops early stops the scan,
+    /// which is the other half of it, and `batch_rows` says how many
+    /// rows a batch may hold when the rows are going somewhere with a
+    /// size of its own. It is a ceiling rather than a size: the engine
+    /// fills whole vectors and a batch holds as many of them as fit
+    /// under the number, so a round figure comes back a little short
+    /// unless a vector divides by it.
+    ///
+    /// The stream holds the connection until it ends, because a
+    /// connection runs one statement at a time. Read it to the end,
+    /// close it, or open it in a `with` block, which closes it however
+    /// the block is left.
+    #[pyo3(signature = (statement, params = None, *, batch_rows = None))]
+    fn stream(
+        &self,
+        py: Python<'_>,
+        statement: &str,
+        params: Option<&Bound<'_, PyDict>>,
+        batch_rows: Option<usize>,
+    ) -> PyResult<stream::Stream> {
+        stream::open(
+            py,
+            &self.inner,
+            &self.stop,
+            &self.feeding,
+            self.alive.load(Ordering::Acquire),
+            statement.to_string(),
+            bind(params)?,
+            batch_rows,
+        )
     }
 
     /// Compiles a statement now and hands back something that runs it
@@ -340,6 +390,11 @@ impl Connection {
     /// Doing it twice is not an error, because a `with` block that
     /// closed early would otherwise fail on the way out.
     fn close(&self, py: Python<'_>) {
+        // A stream is told first. Closing waits for the connection's
+        // lock and a stream holds it for as long as its reader takes,
+        // so a connection closed under a half-read one would wait for a
+        // loop nobody is going to run again.
+        self.feeding.hang_up();
         // Released here too, because closing waits for the statement
         // another thread is running and frees caches worth megabytes
         // once it has.
@@ -422,6 +477,7 @@ impl Connection {
             inner: Arc::new(Mutex::new(Some(opened))),
             runner: OnceLock::new(),
             alive: AtomicBool::new(true),
+            feeding: Arc::new(stream::Feeding::new()),
             path,
             read_only,
         })
@@ -476,6 +532,9 @@ impl Connection {
         source: Source,
         params: Vec<(String, Value)>,
     ) -> PyResult<Result> {
+        if self.feeding.busy() {
+            return Err(programming(py, stream::STREAMING));
+        }
         // The GIL goes down for the whole statement, waiting for the
         // connection's own lock included. That is the point of a
         // compiled engine in a Python process: another thread runs
@@ -537,6 +596,9 @@ impl Connection {
     {
         if !self.alive.load(Ordering::Acquire) {
             return Err(closed(py, "this connection"));
+        }
+        if self.feeding.busy() {
+            return Err(programming(py, stream::STREAMING));
         }
         py.detach(|| {
             let mut held = self.inner.lock().map_err(|_| ())?;

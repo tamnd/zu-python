@@ -32,6 +32,12 @@ T = TypeVar("T")
 # scheduled.
 WORK = "MATCH (a:person), (b:person) WHERE a.uid < b.uid RETURN count(a) AS n"
 
+# The same pairs, returned rather than counted, which is millions of
+# rows and so a statement that is still running however long a test
+# takes to look at it. Every streaming test that says something about a
+# stream that has not ended is written on this one.
+PAIRS = "MATCH (a:person), (b:person) WHERE a.uid < b.uid RETURN a.uid AS a, b.uid AS b"
+
 # Three thousand people is about a second of that work on the machine
 # this was written on, and six thousand about three seconds. The first
 # is for the tests that wait for the statement to end and the second
@@ -414,3 +420,77 @@ async def test_sql_is_execute_under_another_name(tmp_path: Path) -> None:
         await conn.sql("INSERT (p:person {uid: 10, name: 'ada'})")
         rows = await conn.sql("MATCH (p:person) RETURN p.name AS name")
         assert rows.fetchall() == [("ada",)]
+
+
+@run
+async def test_a_stream_gives_back_its_rows_awaited_one_at_a_time(tmp_path: Path) -> None:
+    conn = await crowded(tmp_path / "streamed.zu1", WATCHED)
+    async with conn:
+        async with conn.stream("MATCH (p:person) RETURN p.uid AS uid") as rows:
+            assert await rows.columns() == ["uid"]
+            seen = [uid async for (uid,) in rows]
+        assert seen == list(range(WATCHED))
+        assert rows.summary is not None
+        assert rows.summary.rows == WATCHED
+
+
+@run
+@pytest.mark.timing
+async def test_the_loop_runs_while_a_stream_waits_for_a_batch(tmp_path: Path) -> None:
+    """The reason streaming is here at all rather than in the sync
+    client only: a task reading rows off a scan leaves the loop free
+    between the batches, so everything else on it keeps its turn.
+    """
+    conn = await crowded(tmp_path / "free.zu1", LONG)
+    ticks = 0
+
+    async def tick() -> None:
+        nonlocal ticks
+        while True:
+            ticks += 1
+            await asyncio.sleep(0.001)
+
+    async with conn:
+        counting = asyncio.create_task(tick())
+        async with conn.stream(PAIRS) as rows:
+            await rows.__anext__()
+            await asyncio.sleep(0.05)
+        counting.cancel()
+
+    assert ticks > 10
+
+
+@run
+async def test_a_stream_holds_the_connection_until_it_ends(tmp_path: Path) -> None:
+    conn = await crowded(tmp_path / "held.zu1", WATCHED)
+    async with conn:
+        rows = await conn.stream(PAIRS)
+        await rows.__anext__()
+
+        with pytest.raises(zudb.ProgrammingError, match="runs one statement at a time"):
+            await conn.execute("MATCH (p:person) RETURN count(*) AS n")
+
+        await rows.close()
+        counted = await conn.execute("MATCH (p:person) RETURN count(*) AS n")
+        assert counted.fetchall() == [(WATCHED,)]
+        assert rows.closed is True
+
+
+@run
+async def test_a_stream_reads_in_batches_when_it_is_asked_to(tmp_path: Path) -> None:
+    conn = await crowded(tmp_path / "batched.zu1", WATCHED)
+    async with conn:
+        async with conn.stream("MATCH (p:person) RETURN p.uid AS uid", batch_rows=250) as rows:
+            sizes = [len(batch) async for batch in rows.batches()]
+
+    assert sum(sizes) == WATCHED
+    assert max(sizes) <= 250
+
+
+@run
+async def test_a_stream_that_fails_raises_at_the_row_it_failed_on(tmp_path: Path) -> None:
+    async with zudb.aio.connect(tmp_path / "broken.zu1") as conn:
+        await conn.execute("INSERT (p:person {uid: 10, name: 'ada'})")
+        rows = await conn.stream("MATCH (")
+        with pytest.raises(zudb.SyntaxError):
+            await rows.__anext__()

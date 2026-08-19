@@ -49,7 +49,18 @@ from concurrent.futures import Future, ThreadPoolExecutor
 from typing import Any, Generic, TypeVar
 
 from . import _zudb
-from ._zudb import Appender, Connection, Plan, Prepared, Profile, Result, Transaction
+from ._zudb import (
+    Appender,
+    Connection,
+    Plan,
+    Prepared,
+    Profile,
+    Result,
+    Stream,
+    StreamBatches,
+    StreamSummary,
+    Transaction,
+)
 from .types import Value
 
 __all__ = [
@@ -58,9 +69,17 @@ __all__ = [
     "AsyncTransaction",
     "AsyncAppender",
     "AsyncPrepared",
+    "AsyncStream",
+    "AsyncStreamBatches",
 ]
 
 T = TypeVar("T")
+
+#: Handed to `next` so that the end of a stream arrives as a value on the
+#: connection's thread. A `StopIteration` raised there would cross a
+#: future on its way back, and a `StopIteration` crossing a future is the
+#: one exception asyncio cannot let through.
+_NOTHING = object()
 
 
 def connect(
@@ -251,6 +270,45 @@ class AsyncConnection:
         operators really did.
         """
         return await self._call(functools.partial(self._conn.profile, statement, params))
+
+    def stream(
+        self,
+        statement: str,
+        params: Mapping[str, Value] | None = None,
+        *,
+        batch_rows: int | None = None,
+    ) -> _Opening[AsyncStream]:
+        """Runs one statement and hands back its rows as the engine
+        makes them.
+
+            async with conn.stream("MATCH (p:person) RETURN p.name AS name") as rows:
+                async for (name,) in rows:
+                    await write(name)
+
+        This is the call for a result too big to want in memory and for
+        one whose first rows are worth having before the last are made.
+        The statement runs on a thread of its own, not this connection's,
+        and every wait for a batch is handed off the loop like every
+        other wait here, so a task reading a stream leaves the loop free
+        between batches.
+
+        A stream holds the connection until it ends, so a statement run
+        on the same connection while one is open is refused rather than
+        queued behind a loop that may never finish. Read it to the end,
+        close it, or open it with `async with`.
+        """
+        return _Opening(functools.partial(self._stream, statement, params, batch_rows))
+
+    async def _stream(
+        self,
+        statement: str,
+        params: Mapping[str, Value] | None,
+        batch_rows: int | None,
+    ) -> AsyncStream:
+        opened = await self._call(
+            functools.partial(self._conn.stream, statement, params, batch_rows=batch_rows)
+        )
+        return AsyncStream(self, opened)
 
     def transaction(self, *, read_only: bool = False) -> _Opening[AsyncTransaction]:
         """Starts a transaction and hands it back for an `async with`
@@ -597,3 +655,113 @@ class AsyncPrepared:
     def __repr__(self) -> str:
         closed = ", closed" if self.closed else ""
         return f"<zudb.aio.AsyncPrepared {self.statement!r}{closed}>"
+
+
+class AsyncStream:
+    """Rows arriving one batch at a time, awaited a row at a time.
+
+    Take one with `AsyncConnection.stream`. The stream underneath is
+    `zudb.Stream` and the rules are its rules: it holds the connection
+    until it ends, closing it twice does nothing, and the summary is
+    there once the statement is over whether it ran out of rows or was
+    stopped.
+
+    Waiting for the next batch is handed to the connection's thread, so
+    the loop is free while the engine is working. The rows of a batch
+    already in hand are turned into tuples on the loop's thread, which is
+    the same work `Result` does when it is read, and there is nothing to
+    wait for in it.
+    """
+
+    __slots__ = ("_conn", "_stream")
+
+    def __init__(self, conn: AsyncConnection, stream: Stream) -> None:
+        self._conn = conn
+        self._stream = stream
+
+    async def columns(self) -> list[str]:
+        """The column names, in the order the statement projects them.
+
+        A method where the sync client has a property, because answering
+        reads the first batch and reading a batch can wait.
+        """
+        return await self._conn._call(lambda: self._stream.columns)
+
+    @property
+    def summary(self) -> StreamSummary | None:
+        """What the statement did, once it has done it, and `None` while
+        it is still running.
+
+        A property and not a coroutine: the answer is beside the queue
+        rather than behind the engine, so asking reaches nothing that
+        could wait.
+        """
+        return self._stream.summary
+
+    @property
+    def closed(self) -> bool:
+        """Whether the statement is over, by running out of rows or by
+        being closed.
+        """
+        return self._stream.closed
+
+    def batches(self) -> AsyncStreamBatches:
+        """The rows in the batches they arrived in, as lists of tuples.
+
+        For a writer with a size of its own: one await per batch rather
+        than one per row, and one call into whatever is being written to.
+        """
+        return AsyncStreamBatches(self._conn, self._stream.batches())
+
+    async def close(self) -> None:
+        """Stops the statement and gives the connection back.
+
+        Awaited because it waits for the statement to stop, so the
+        connection is free by the time the call returns. Doing it twice
+        is not an error.
+        """
+        await self._conn._call(self._stream.close)
+
+    def __aiter__(self) -> AsyncStream:
+        return self
+
+    async def __anext__(self) -> tuple[Value, ...]:
+        row = await self._conn._call(functools.partial(next, self._stream, _NOTHING))
+        if row is _NOTHING:
+            raise StopAsyncIteration
+        return row  # type: ignore[return-value]
+
+    async def __aenter__(self) -> AsyncStream:
+        return self
+
+    async def __aexit__(self, *_exception: Any) -> bool:
+        """Closes on the way out, whether the block ended well or badly,
+        so the connection comes back either way.
+        """
+        await self.close()
+        return False
+
+    def __repr__(self) -> str:
+        return f"<zudb.aio.AsyncStream of {self._stream!r}>"
+
+
+class AsyncStreamBatches:
+    """The same rows, in the batches they arrived in."""
+
+    __slots__ = ("_conn", "_batches")
+
+    def __init__(self, conn: AsyncConnection, batches: StreamBatches) -> None:
+        self._conn = conn
+        self._batches = batches
+
+    def __aiter__(self) -> AsyncStreamBatches:
+        return self
+
+    async def __anext__(self) -> list[tuple[Value, ...]]:
+        batch = await self._conn._call(functools.partial(next, self._batches, _NOTHING))
+        if batch is _NOTHING:
+            raise StopAsyncIteration
+        return batch  # type: ignore[return-value]
+
+    def __repr__(self) -> str:
+        return f"<zudb.aio.AsyncStreamBatches of {self._batches!r}>"
