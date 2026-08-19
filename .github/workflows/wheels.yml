@@ -14,6 +14,7 @@ on:
       - pyproject.toml
       - rust-toolchain.toml
       - tools/wheel_tags.py
+      - tools/reference.py
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
@@ -196,6 +197,41 @@ jobs:
           name: sdist
           path: dist/*.tar.gz
 
+  # The reference, built from the wheel this release is publishing and
+  # not from the checkout it came out of. Half of this package is
+  # compiled, so a reference generated from source would be a reference
+  # of the half a reader can read already, and the interesting half
+  # exists only once it is built.
+  #
+  # One wheel is enough and it is the stable-ABI Linux one, because
+  # what is being read is the public surface and every wheel in the
+  # grid has the same one. A grid of fourteen references would be
+  # fourteen copies of one page and thirteen chances for a reader to
+  # find the wrong one.
+  reference:
+    needs: wheel
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.14"
+      - uses: actions/download-artifact@v4
+        with:
+          name: wheel-abi3-manylinux_2_28_x86_64
+          path: dist
+      - run: pip install --no-index --find-links dist zudb
+      # ipython because `zudb.magic` imports it at the top and a module
+      # that cannot be imported cannot be documented, and it is the
+      # `%%gql` half of this client rather than an extra.
+      - run: pip install pdoc==16.0.0 ipython
+      - run: python tools/reference.py reference
+      - uses: actions/upload-artifact@v4
+        with:
+          name: reference
+          path: reference/
+          if-no-files-found: error
+
   # The grid, checked as a grid. Every cell filled and nothing outside
   # it, which is the check a single row cannot do.
   tags:
@@ -203,10 +239,20 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
+      # By name rather than everything this run produced, because the
+      # check is that the directory holds the grid and nothing else,
+      # and the reference job puts a directory of HTML in the same run.
+      # A rule that says "nothing outside the grid" reads whatever it
+      # is handed, so what it is handed has to be the grid.
       - uses: actions/download-artifact@v4
         with:
+          pattern: wheel-*
           path: dist
           merge-multiple: true
+      - uses: actions/download-artifact@v4
+        with:
+          name: sdist
+          path: dist
       - uses: actions/setup-python@v6
         with:
           python-version: "3.14"

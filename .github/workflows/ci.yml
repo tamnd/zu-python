@@ -116,8 +116,10 @@ jobs:
       - run: pip install ".[all]"
       # griffe reads the stub and inspects the installed extension, so
       # the check runs against the wheel rather than against the
-      # checkout it was built from.
-      - run: pip install pytest griffe ipython
+      # checkout it was built from. pdoc is here for the same reason:
+      # the reference is generated from the installed package, and the
+      # test that says so has nothing to read without it.
+      - run: pip install pytest griffe ipython pdoc==16.0.0
       - run: pytest
 
   # The same suite again, over an extension built with AddressSanitizer.
