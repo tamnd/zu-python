@@ -71,6 +71,39 @@ def test_fetchmany_takes_arraysize_when_it_is_not_told(conn: dbapi.Connection) -
     assert cur.fetchmany() == [("grace",), ("kay",)]
 
 
+def test_a_block_reaches_across_the_rows_read_to_type_the_columns(
+    conn: dbapi.Connection,
+) -> None:
+    """One call, and the join in the middle of it does not show."""
+    cur = conn.cursor()
+    cur.execute("MATCH (p:person) RETURN p.name AS name")
+    assert cur.fetchmany(3) == [("ada",), ("grace",), ("kay",)]
+
+
+def test_a_block_bigger_than_what_is_left_gives_what_is_left(conn: dbapi.Connection) -> None:
+    cur = conn.cursor()
+    cur.execute("MATCH (p:person) RETURN p.name AS name")
+    assert cur.fetchmany(1000) == [("ada",), ("grace",), ("kay",)]
+    assert cur.fetchmany(1000) == []
+
+
+def test_a_block_of_no_rows_takes_none(conn: dbapi.Connection) -> None:
+    """A page size read from configuration can be zero, and it means zero."""
+    cur = conn.cursor()
+    cur.execute("MATCH (p:person) RETURN p.name AS name")
+    assert cur.fetchmany(0) == []
+    assert cur.fetchone() == ("ada",)
+
+
+def test_a_block_of_fewer_than_no_rows_is_refused(conn: dbapi.Connection) -> None:
+    """An empty list would read as the end of the rows and end a loop early."""
+    cur = conn.cursor()
+    cur.execute("MATCH (p:person) RETURN p.name AS name")
+    with pytest.raises(dbapi.ProgrammingError, match="-1 is not one"):
+        cur.fetchmany(-1)
+    assert cur.fetchall() == [("ada",), ("grace",), ("kay",)]
+
+
 def test_a_cursor_iterates(conn: dbapi.Connection) -> None:
     """An extension PEP 249 names, and the way anyone actually reads rows."""
     cur = conn.cursor()

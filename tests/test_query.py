@@ -26,6 +26,41 @@ def test_fetchone_walks_the_rows_and_then_answers_none(social: zudb.Connection) 
     assert rows.fetchone() is None
 
 
+def test_fetchmany_takes_a_block_and_moves_the_cursor_once(social: zudb.Connection) -> None:
+    rows = social.execute("MATCH (p:person) RETURN p.uid AS uid ORDER BY uid")
+    assert rows.fetchmany(2) == [(10,), (20,)]
+    assert rows.fetchmany(2) == [(30,)]
+    assert rows.fetchmany(2) == []
+
+
+def test_fetchmany_takes_one_row_when_it_is_not_told_how_many(social: zudb.Connection) -> None:
+    rows = social.execute("MATCH (p:person) RETURN p.uid AS uid ORDER BY uid")
+    assert rows.fetchmany() == [(10,)]
+    assert rows.fetchone() == (20,)
+    assert rows.fetchmany() == [(30,)]
+
+
+def test_fetchmany_and_fetchone_share_one_position(social: zudb.Connection) -> None:
+    rows = social.execute("MATCH (p:person) RETURN p.uid AS uid ORDER BY uid")
+    assert rows.fetchone() == (10,)
+    assert rows.fetchmany(10) == [(20,), (30,)]
+    assert rows.fetchone() is None
+
+
+def test_fetchmany_of_no_rows_takes_none_and_leaves_the_position(social: zudb.Connection) -> None:
+    rows = social.execute("MATCH (p:person) RETURN p.uid AS uid ORDER BY uid")
+    assert rows.fetchmany(0) == []
+    assert rows.fetchone() == (10,)
+
+
+def test_fetchmany_of_fewer_than_no_rows_is_refused(social: zudb.Connection) -> None:
+    rows = social.execute("MATCH (p:person) RETURN p.uid AS uid ORDER BY uid")
+    with pytest.raises(ValueError, match="-1 is not one"):
+        rows.fetchmany(-1)
+    # Refused before anything moved, so the first row is still the first.
+    assert rows.fetchone() == (10,)
+
+
 def test_iterating_does_not_move_the_cursor(social: zudb.Connection) -> None:
     rows = social.execute("MATCH (p:person) RETURN p.uid AS uid ORDER BY uid")
     assert [uid for (uid,) in rows] == [10, 20, 30]

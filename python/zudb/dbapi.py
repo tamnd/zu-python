@@ -459,9 +459,10 @@ class Cursor:
         self._description: tuple[tuple[Any, ...], ...] | None = None
         self._rowcount = -1
         #: Rows `fetchmany` takes when it is not told how many. One,
-        #: which PEP 249 asks for and nobody should leave alone: rows
-        #: are already in memory here, so a bigger number costs
-        #: nothing and saves calls.
+        #: which PEP 249 asks for and nobody should leave alone: the
+        #: rows are already in memory here and a block of them is one
+        #: call into the engine, so a bigger number costs nothing and
+        #: saves a crossing per row.
         self.arraysize = 1
 
     @property
@@ -557,29 +558,53 @@ class Cursor:
         result = self._rows()
         if self._ahead:
             return self._ahead.popleft()
-        with _translating():
+        # `_translating()` written out, and only here. It is a
+        # generator-based context manager, which costs about a
+        # microsecond to enter and leave, and this is the one call in
+        # the layer that a caller makes once per row: entering it a
+        # million times took longer than reading the million rows.
+        try:
             return result.fetchone()
+        except zudb.Error as failure:
+            _reraise(failure)
 
     def fetchmany(self, size: int | None = None) -> list[tuple[Value, ...]]:
-        """The next `size` rows, or as many as are left."""
-        self._rows()
+        """The next `size` rows, or as many as are left.
+
+        `size` defaults to `arraysize`, which PEP 249 sets at one. The
+        block is taken in a single call into the engine rather than a
+        call per row, so the number is worth raising: a page of a
+        thousand rows costs one crossing here and a thousand crossings
+        in a loop over `fetchone`.
+
+        A negative `size` is a mistake and is refused. Returning an
+        empty list for it would look exactly like the end of the rows,
+        and the loop that asked would stop early and quietly.
+        """
+        result = self._rows()
         wanted = self.arraysize if size is None else size
+        if wanted < 0:
+            raise ProgrammingError(f"fetchmany wants a number of rows, and {wanted} is not one")
         got: list[tuple[Value, ...]] = []
-        while len(got) < wanted:
-            row = self.fetchone()
-            if row is None:
-                break
-            got.append(row)
+        while self._ahead and len(got) < wanted:
+            got.append(self._ahead.popleft())
+        if len(got) < wanted:
+            with _translating():
+                got.extend(result.fetchmany(wanted - len(got)))
         return got
 
     def fetchall(self) -> list[tuple[Value, ...]]:
-        """Every row that has not been fetched yet."""
+        """Every row that has not been fetched yet.
+
+        One crossing, like `fetchmany`: `len(result)` is every row the
+        statement produced, which is never fewer than the rows left, and
+        asking for more than are left gives what is left.
+        """
         result = self._rows()
         taken = list(self._ahead)
         self._ahead.clear()
         with _translating():
-            while (row := result.fetchone()) is not None:
-                taken.append(row)
+            taken.extend(result.fetchmany(len(result)))
         return taken
 
     def setinputsizes(self, sizes: Iterable[object]) -> None:

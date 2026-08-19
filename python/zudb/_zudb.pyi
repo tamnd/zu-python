@@ -465,6 +465,9 @@ class Result:
     def fetchone(self) -> tuple[Value, ...] | None:
         """The next row, or `None` when there are no more."""
 
+    def fetchmany(self, size: int = 1) -> list[tuple[Value, ...]]:
+        """The next `size` rows, or as many as are left."""
+
     # `Any` and not `pyarrow.Table`, because the wheel does not depend
     # on pyarrow and a stub that imported it would fail to resolve for
     # every caller who does not have it either.

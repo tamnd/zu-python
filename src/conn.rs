@@ -725,6 +725,41 @@ impl Result {
         self.row(py, row).map(Some)
     }
 
+    /// The next `size` rows, or as many as are left.
+    ///
+    /// The block form of `fetchone`, and the reason to prefer it is
+    /// the same one the streaming reader gives for reading batches: a
+    /// block is one call where a row is one call, and the call is what
+    /// costs. The position moves once, at the end, so a conversion
+    /// that fails leaves the result where it was rather than half a
+    /// block further on.
+    ///
+    /// Asking for more rows than are left gives what is left. Asking
+    /// for none gives none, which is what a loop over a page size read
+    /// from configuration wants; asking for fewer than none is a
+    /// mistake and says so.
+    #[pyo3(signature = (size = 1))]
+    fn fetchmany<'py>(&self, py: Python<'py>, size: isize) -> PyResult<Bound<'py, PyList>> {
+        if size < 0 {
+            return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                "fetchmany wants a number of rows, and {size} is not one"
+            )));
+        }
+        let mut next = self.next.lock().map_err(|_| {
+            pyo3::exceptions::PyRuntimeError::new_err("this result was left locked by a panic")
+        })?;
+        let from = *next;
+        let upto = from
+            .saturating_add(size as usize)
+            .min(self.result.rows.len());
+        let rows = PyList::empty(py);
+        for row in &self.result.rows[from..upto] {
+            rows.append(self.row(py, row)?)?;
+        }
+        *next = upto;
+        Ok(rows)
+    }
+
     /// The warnings the statement raised, if it raised any. A notice
     /// is a condition that did not stop the statement, so it arrives
     /// beside the rows rather than instead of them.
