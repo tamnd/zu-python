@@ -377,7 +377,21 @@ def _scalar(text: str, line: int) -> Node:
     return Node("scalar", line, text=text, quoted=False)
 
 
-_ESCAPES = {'"': '"', "\\": "\\", "n": "\n", "r": "\r", "t": "\t", "0": "\0"}
+# The escapes the corpus uses, which is a subset of YAML's. The ones
+# that name a code point by its digits are not here, because the corpus
+# writes those as the character itself and a case that wants the digits
+# is testing the engine's own escapes inside a query rather than the
+# file's.
+_ESCAPES = {
+    '"': '"',
+    "\\": "\\",
+    "n": "\n",
+    "r": "\r",
+    "t": "\t",
+    "0": "\0",
+    "b": "\b",
+    "f": "\f",
+}
 
 
 def _unescape(body: str, line: int) -> str:

@@ -483,7 +483,7 @@ class Result:
     def to_polars(self) -> Any:
         """The rows as a `polars.DataFrame`."""
 
-    def record_batches(self) -> Any:
+    def record_batches(self, rows_per_batch: int | None = None) -> Any:
         """The rows as a `pyarrow.RecordBatchReader`, a batch at a time."""
 
     def __arrow_c_stream__(self, requested_schema: object | None = None) -> Any:

@@ -217,7 +217,11 @@ def _case(node: Node) -> Case:
             f"line {line}: a case says what it produces, with `columns:` and `rows:` or with "
             "`raises:`"
         )
-    names = columns_node.seq()
+    # Empty counts, because `FINISH` is a query that answers no columns
+    # at all, which is not the same as a query whose columns held no
+    # rows, and the corpus writes it as a `columns:` with nothing under
+    # it.
+    names = columns_node.seq_or_empty()
     if names is None:
         raise CorpusError(f"line {line}: `columns:` is a sequence of names")
     columns = []

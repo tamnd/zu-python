@@ -18,17 +18,22 @@ crate-type = ["cdylib"]
 # with (ADR 0002), so a revision is the honest way to say which one.
 # A local checkout is used instead with a `paths` override in
 # `.cargo/config.toml`, which is untracked on purpose.
-zudb = { package = "zu", git = "https://github.com/tamnd/zu", rev = "130f67db924bcd0f766ee814b0da2edae32150d4" }
-zu-common = { git = "https://github.com/tamnd/zu", rev = "130f67db924bcd0f766ee814b0da2edae32150d4" }
+zudb = { package = "zu", git = "https://github.com/tamnd/zu", rev = "0698a4eccd31670f0a875b6d097d7753440a51b3" }
+zu-common = { git = "https://github.com/tamnd/zu", rev = "0698a4eccd31670f0a875b6d097d7753440a51b3" }
+# The one translation from a result into Arrow, which lives in the
+# engine tree so that every client agrees about what a column becomes.
+# `ffi` is the only feature this client turns on: what Python wants is
+# the C Data Interface, which is how a result reaches pyarrow, pandas
+# and polars without a Python object per cell.
+zu-arrow = { git = "https://github.com/tamnd/zu", rev = "0698a4eccd31670f0a875b6d097d7753440a51b3", features = ["ffi"] }
 # `extension-module` is asked for by maturin, in pyproject.toml, and
 # not here. Only the build backend knows how an extension is linked on
 # the platform it is building for, and a crate that turns the feature
 # on by default is a crate `cargo build` cannot link on its own.
 pyo3 = { version = "0.29" }
-# Arrow, for the columns a result leaves as. Only `ffi` is asked for:
-# the readers and writers are the engine's business and what is wanted
-# here is the C Data Interface, which is how a result reaches pyarrow,
-# pandas and polars without a Python object per cell.
+# Arrow again, directly, because reading one is this client's job too:
+# `register` takes a frame from pandas or polars over the same C Data
+# Interface, and that side is a reader and not a writer.
 arrow = { version = "59", default-features = false, features = ["ffi"] }
 numpy = "0.29"
 

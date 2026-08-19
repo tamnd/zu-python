@@ -12,13 +12,14 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 
+use arrow::ffi_stream::FFI_ArrowArrayStream;
 use pyo3::prelude::*;
 use pyo3::types::{PyCapsule, PyDict, PyList, PyTuple};
 use zudb::query::{QueryResult, Value};
 use zudb::{Config, Database, Interrupt};
 
 use crate::appender::Appender;
-use crate::columns;
+use crate::columns::{self, Raise};
 use crate::error::{closed, programming, to_py_err};
 use crate::html;
 use crate::interrupt;
@@ -799,7 +800,7 @@ impl Result {
         // in a DataFrame is big enough that another thread should get
         // to run while it happens.
         let stream = py
-            .detach(|| columns::stream(&self.result, &self.names))
+            .detach(|| columns::stream(&self.result, &self.names, columns::BATCH))
             .map_err(|snag| snag.raise(py))?;
         PyCapsule::new_with_value(py, stream, STREAM)
     }
@@ -863,16 +864,34 @@ impl Result {
     ///
     /// The same data as `to_arrow`, handed over in batches of sixty-five
     /// thousand rows instead of as one table, which is what a consumer
-    /// that writes as it reads wants.
+    /// that writes as it reads wants. `rows_per_batch` says otherwise
+    /// for a consumer that has a size in mind, a Parquet row group or
+    /// whatever its own downstream takes.
     ///
     /// A batch is a view of the column it comes from rather than a copy
     /// of it, and it is cut when the reader asks for it, so a consumer
-    /// that stops early stops paying.
-    fn record_batches<'py>(slf: PyRef<'py, Self>) -> PyResult<Bound<'py, PyAny>> {
+    /// that stops early stops paying, and the size costs nothing either
+    /// way.
+    #[pyo3(signature = (rows_per_batch = None))]
+    fn record_batches<'py>(
+        slf: PyRef<'py, Self>,
+        rows_per_batch: Option<i64>,
+    ) -> PyResult<Bound<'py, PyAny>> {
         let py = slf.py();
-        needed(py, "pyarrow", "arrow")?
-            .getattr("RecordBatchReader")?
-            .call_method1("from_stream", (slf,))
+        let rows = match rows_per_batch {
+            Some(rows) if rows < 1 => return Err(programming(py, EMPTY_BATCH)),
+            Some(rows) => rows as usize,
+            None => columns::BATCH,
+        };
+        let reader = needed(py, "pyarrow", "arrow")?.getattr("RecordBatchReader")?;
+        // Borrowed out of the reference before the GIL goes down,
+        // because what the other thread may touch is the result and not
+        // the Python object holding it.
+        let (result, names) = (&slf.result, &slf.names);
+        let stream = py
+            .detach(|| columns::stream(result, names, rows))
+            .map_err(|snag| snag.raise(py))?;
+        reader.call_method1("from_stream", (Batches::holding(py, stream)?,))
     }
 
     fn __len__(&self) -> usize {
@@ -943,6 +962,67 @@ impl Result {
         )
     }
 }
+
+/// What a batch size of nothing gets told.
+const EMPTY_BATCH: &str = "rows_per_batch has to be at least one, because a reader cutting a \
+     result into batches of no rows never reaches the end of it";
+
+/// A stream that has already been cut to a size, waiting to be taken.
+///
+/// `__arrow_c_stream__` takes no arguments, because the PyCapsule
+/// protocol has none to give it, so a caller who asked for a batch size
+/// cannot be handed the result itself. This is what it is handed
+/// instead: the same capsule, off a stream that was built with the size
+/// the caller wanted, and nothing else.
+///
+/// It is a one-shot. The protocol's rule is that the consumer owns the
+/// stream from the moment it takes the capsule, so there is nothing
+/// left here to hand to a second one.
+#[pyclass(module = "zudb")]
+pub struct Batches {
+    stream: Mutex<Option<FFI_ArrowArrayStream>>,
+}
+
+impl Batches {
+    /// One holding a stream, as the Python object it has to be to reach
+    /// `RecordBatchReader.from_stream`.
+    fn holding(py: Python<'_>, stream: FFI_ArrowArrayStream) -> PyResult<Py<Batches>> {
+        Py::new(
+            py,
+            Batches {
+                stream: Mutex::new(Some(stream)),
+            },
+        )
+    }
+}
+
+#[pymethods]
+impl Batches {
+    /// The capsule, once.
+    ///
+    /// `requested_schema` is accepted and ignored for the same reason a
+    /// result ignores it: the columns have the types they have, and
+    /// casting them here would hide a conversion a caller can see.
+    #[pyo3(signature = (requested_schema = None))]
+    fn __arrow_c_stream__<'py>(
+        &self,
+        py: Python<'py>,
+        requested_schema: Option<Bound<'py, PyAny>>,
+    ) -> PyResult<Bound<'py, PyCapsule>> {
+        let _ = requested_schema;
+        let taken = self
+            .stream
+            .lock()
+            .map_err(|_| programming(py, TAKEN))?
+            .take()
+            .ok_or_else(|| programming(py, TAKEN))?;
+        PyCapsule::new_with_value(py, taken, STREAM)
+    }
+}
+
+/// What a second reader of the same batches gets told.
+const TAKEN: &str = "these batches have already been read, and a stream is handed over once: call \
+     record_batches again for another reader";
 
 /// A module the caller has to have installed for this call, imported.
 ///
