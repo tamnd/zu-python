@@ -201,9 +201,11 @@ def test_a_result_with_no_rows_still_has_its_columns(loaded: zudb.Connection) ->
     table = loaded.execute("MATCH (p:person) WHERE p.uid = 99 RETURN p.uid AS uid").to_arrow()
     assert table.num_rows == 0
     assert table.column_names == ["uid"]
-    # Nothing said what the column holds, so it holds nothing, which
-    # Arrow has a type for.
-    assert table.schema.field("uid").type == pa.null()
+    # The type comes off the column and not off the rows, so a result
+    # that matched nothing still says what it would have held. That is
+    # what a consumer writing Parquet or appending to an existing table
+    # needs from a query that happened to find no rows.
+    assert table.schema.field("uid").type == pa.int64()
 
 
 @pytest.mark.parametrize(
@@ -247,6 +249,28 @@ def test_the_batches_are_the_same_rows(tmp_path: Path) -> None:
     # add up to the result.
     assert len(batches) == 2
     assert sum(batch.num_rows for batch in batches) == rows
+
+
+def test_a_caller_can_say_how_big_a_batch_is(loaded: zudb.Connection) -> None:
+    reader = loaded.execute("MATCH (p:person) RETURN p.uid AS uid").record_batches(2)
+    batches = list(reader)
+    assert [batch.num_rows for batch in batches] == [2, 1]
+    assert pa.Table.from_batches(batches).column("uid").to_pylist() == [10, 20, 30]
+
+
+def test_a_batch_of_no_rows_is_refused(loaded: zudb.Connection) -> None:
+    with pytest.raises(zudb.ProgrammingError, match="at least one"):
+        loaded.execute("MATCH (p:person) RETURN p.uid AS uid").record_batches(0)
+
+
+def test_the_batches_of_a_result_read_once(loaded: zudb.Connection) -> None:
+    result = loaded.execute("MATCH (p:person) RETURN p.uid AS uid")
+    first = result.record_batches()
+    assert sum(batch.num_rows for batch in first) == 3
+    # The result is still there and still holds its rows, so asking it
+    # again is a second reader and not an error.
+    second = result.record_batches()
+    assert sum(batch.num_rows for batch in second) == 3
 
 
 def test_a_result_reads_as_arrow_and_as_objects_and_says_the_same_thing(

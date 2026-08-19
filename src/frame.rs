@@ -45,7 +45,7 @@ use zu_common::{DurationKind, FloatBits, IntBits, LogicalType};
 use zudb::{Column, Layout};
 
 use crate::buffer::{self, type_name};
-use crate::columns::Snag;
+use crate::columns::{Raise, Snag};
 use crate::load;
 
 /// What a capsule holding an Arrow stream is called, which a consumer
