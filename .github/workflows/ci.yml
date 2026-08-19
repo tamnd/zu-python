@@ -222,6 +222,17 @@ jobs:
       # whose every frame reads ??? says a number and nothing a person
       # can act on, and the suppression file cannot name a function it
       # has no name for.
+      #
+      # Three settings and not one, because two things strip this wheel
+      # and only one of them is cargo. `strip = true` in pyproject.toml
+      # is maturin's own, applied after the build and to the artifact
+      # rather than through the profile, so a cargo profile that says to
+      # keep the symbols is a cargo profile maturin then throws away.
+      # That is what happened the first time this job ran the suite: one
+      # eighty byte record out of pyo3's type constructor, named in the
+      # suppression file, reported with ??? on every frame and matched
+      # by nothing.
+      #
       # Every optional dependency except polars, which starts a thread
       # pool the moment it is imported and holds a block of thread-local
       # state per worker for the life of the process. Valgrind reports
@@ -231,8 +242,20 @@ jobs:
       # through them.
       - run: pip install ".[pandas]" pytest ipython
         env:
+          MATURIN_STRIP: "false"
           CARGO_PROFILE_RELEASE_STRIP: "false"
           CARGO_PROFILE_RELEASE_DEBUG: "1"
+      # Said here rather than trusted, because the whole job rests on it
+      # and the way it fails is an hour of valgrind followed by a report
+      # nobody can read. The section is what valgrind reads a frame's
+      # name out of, and a stripped object has neither it nor a symbol
+      # table to fall back on.
+      - name: The symbols the report is read with
+        run: |
+          set -eu
+          so=$(python -c 'import zudb, pathlib; print(pathlib.Path(zudb.__file__).parent / "_zudb.abi3.so")')
+          readelf -S "$so" | grep -q debug_info \
+            || { echo "$so carries no debug info, so every frame of the report would read ???"; exit 1; }
       - name: A leak the job is meant to catch, caught
         run: |
           set +e
