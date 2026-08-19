@@ -793,7 +793,7 @@ class Connection:
 
 
 def connect(
-    path: str | os.PathLike[str],
+    path: str | os.PathLike[str] | None = None,
     *,
     read_only: bool = False,
     memory_limit: int | None = None,
@@ -802,10 +802,11 @@ def connect(
 ) -> Connection:
     """Opens the database at `path` and connects to it.
 
-    The same arguments `zudb.connect` takes, and one more: with
-    `autocommit` every statement stands alone the way it does on the
-    native client, instead of joining a transaction that runs until
-    `commit` or `rollback`.
+    The same arguments `zudb.connect` takes, no path or `":memory:"`
+    for a database in memory included, and one more: with `autocommit`
+    every statement stands alone the way it does on the native client,
+    instead of joining a transaction that runs until `commit` or
+    `rollback`.
     """
     with _translating():
         conn = zudb.connect(path, read_only=read_only, memory_limit=memory_limit, threads=threads)

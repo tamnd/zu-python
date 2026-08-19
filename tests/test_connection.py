@@ -85,3 +85,56 @@ def test_the_engine_and_abi_versions_are_reported(empty: zudb.Connection) -> Non
 def test_a_memory_limit_and_a_thread_count_are_accepted(tmp_path: Path) -> None:
     with zudb.connect(tmp_path / "tuned.zu1", memory_limit=64 << 20, threads=2) as conn:
         assert conn.execute("RETURN 1 AS one").fetchall() == [(1,)]
+
+
+def test_connect_with_no_path_is_a_database_in_memory(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    with zudb.connect() as conn:
+        assert conn.memory is True
+        assert str(conn.path) == ":memory:"
+        conn.execute("INSERT (p:person {uid: 1, name: 'ada'})")
+        assert conn.execute("MATCH (p:person) RETURN p.name AS n").fetchall() == [("ada",)]
+    assert list(tmp_path.iterdir()) == []
+
+
+def test_the_memory_name_makes_no_file_called_that(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The bug this replaces: `':memory:'` used to make a file called
+    `:memory:` in whatever directory the caller was standing in."""
+    monkeypatch.chdir(tmp_path)
+    with zudb.connect(":memory:") as conn:
+        assert conn.memory is True
+        conn.execute("INSERT (p:person {uid: 1, name: 'ada'})")
+    assert not (tmp_path / ":memory:").exists()
+    assert list(tmp_path.iterdir()) == []
+
+
+def test_two_databases_in_memory_share_nothing() -> None:
+    with zudb.connect() as one, zudb.connect() as two:
+        one.execute("INSERT (p:person {uid: 1, name: 'ada'})")
+        assert one.execute("MATCH (p:person) RETURN p.name AS n").fetchall() == [("ada",)]
+        assert two.execute("MATCH (p:person) RETURN p.name AS n").fetchall() == []
+
+
+def test_a_database_in_memory_takes_a_transaction_and_rolls_it_back() -> None:
+    """It is the whole engine and not a reduced one, so the write path
+    every other test exercises is the write path here too."""
+    with zudb.connect() as conn:
+        conn.execute("INSERT (p:person {uid: 1, name: 'ada'})")
+        with conn.transaction() as work:
+            conn.execute("INSERT (p:person {uid: 2, name: 'grace'})")
+            work.rollback()
+        assert conn.execute("MATCH (p:person) RETURN p.name AS n").fetchall() == [("ada",)]
+
+
+def test_a_database_on_disk_is_not_one_in_memory(tmp_path: Path) -> None:
+    with zudb.connect(tmp_path / "disk.zu1") as conn:
+        assert conn.memory is False
+
+
+def test_a_database_in_memory_cannot_be_read_only() -> None:
+    with pytest.raises(zudb.Error):
+        zudb.connect(read_only=True)

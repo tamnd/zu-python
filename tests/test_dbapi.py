@@ -518,3 +518,15 @@ def test_what_a_repr_says(conn: dbapi.Connection) -> None:
 def test_a_database_that_is_not_there_is_the_class_pep_249_expects(tmp_path: Path) -> None:
     with pytest.raises(dbapi.OperationalError):
         dbapi.connect(tmp_path / "no" / "such" / "place.zu1")
+
+
+def test_connect_with_no_path_is_a_database_in_memory(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    with dbapi.connect() as conn:
+        cur = conn.cursor()
+        cur.execute("INSERT (p:person {uid: 1, name: 'ada'})")
+        cur.execute("MATCH (p:person) RETURN p.name AS n")
+        assert cur.fetchall() == [("ada",)]
+    assert list(tmp_path.iterdir()) == []
