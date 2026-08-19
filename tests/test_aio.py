@@ -106,6 +106,7 @@ async def test_what_comes_back_is_read_without_awaiting(tmp_path: Path) -> None:
 
 
 @run
+@pytest.mark.timing
 async def test_the_loop_runs_while_a_statement_does(tmp_path: Path) -> None:
     """The claim the module is for.
 

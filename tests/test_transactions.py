@@ -205,6 +205,7 @@ def test_a_closed_connection_has_no_transactions(social: zudb.Connection) -> Non
         assert social.in_transaction is None
 
 
+@pytest.mark.timing
 def test_the_wrapper_costs_nothing_worth_measuring(social: zudb.Connection) -> None:
     """Two statements and a Python object, which is what it should be.
 
