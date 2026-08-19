@@ -39,13 +39,19 @@ use pyo3::prelude::*;
 /// connection never creates anything, so a mistyped path there is an
 /// error rather than an empty database.
 ///
+/// With no path, or with `":memory:"`, the database is in memory and
+/// no file is made anywhere. It is the whole engine and not a reduced
+/// one, so it takes writes and transactions and the appender exactly
+/// as a database on disk does, and it is gone when the last connection
+/// to it is.
+///
 /// `memory_limit` is in bytes and `threads` is how many the executor
 /// may use; both default to what the engine decides for the machine.
 #[pyfunction]
-#[pyo3(signature = (path, *, read_only = false, memory_limit = None, threads = None))]
+#[pyo3(signature = (path = None, *, read_only = false, memory_limit = None, threads = None))]
 fn connect(
     py: Python<'_>,
-    path: PathBuf,
+    path: Option<PathBuf>,
     read_only: bool,
     memory_limit: Option<usize>,
     threads: Option<usize>,

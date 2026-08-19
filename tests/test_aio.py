@@ -494,3 +494,16 @@ async def test_a_stream_that_fails_raises_at_the_row_it_failed_on(tmp_path: Path
         rows = await conn.stream("MATCH (")
         with pytest.raises(zudb.SyntaxError):
             await rows.__anext__()
+
+
+@run
+async def test_connect_with_no_path_is_a_database_in_memory(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    async with zudb.aio.connect() as conn:
+        assert conn.memory is True
+        await conn.execute("INSERT (p:person {uid: 10, name: 'ada'})")
+        rows = await conn.execute("MATCH (p:person) RETURN p.name AS n")
+        assert rows.fetchall() == [("ada",)]
+    assert list(tmp_path.iterdir()) == []

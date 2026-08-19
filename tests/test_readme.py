@@ -47,6 +47,17 @@ def programs() -> list[str]:
     return [block for block in blocks("python") if block.startswith("import ")]
 
 
+def program_with(*words: str) -> str:
+    """The one whole program that has all of `words` in it.
+
+    By what it contains rather than by where it sits, because a page
+    that gains a snippet should not renumber the tests below it.
+    """
+    found = [p for p in programs() if all(word in p for word in words)]
+    assert len(found) == 1, f"one program with {words}, found {len(found)}"
+    return found[0]
+
+
 def run(program: str, where: Path) -> subprocess.CompletedProcess[str]:
     """A program, in an interpreter of its own, in `where`."""
     return subprocess.run(
@@ -60,14 +71,13 @@ def run(program: str, where: Path) -> subprocess.CompletedProcess[str]:
 
 def test_the_readme_prints_programs_and_not_fragments() -> None:
     """The rule above holds: the page has both kinds and knows which."""
-    assert len(programs()) == 4, "the README's whole programs"
+    assert len(programs()) == 5, "the README's whole programs"
     assert len(blocks("python")) > len(programs()), "and its fragments"
 
 
 def test_the_sixty_second_snippet_runs_as_printed(tmp_path: Path) -> None:
-    """The first block: connect, write two rows, read them as a frame."""
-    snippet = programs()[0]
-    assert "zudb.connect" in snippet and "to_pandas" in snippet
+    """Connect, write two rows, read them as a frame."""
+    snippet = program_with("zudb.connect", "to_pandas")
     done = run(snippet, tmp_path)
     assert done.returncode == 0, done.stderr
     # The frame pandas prints, whatever pandas decides to pad it with.
@@ -80,18 +90,16 @@ def test_the_sixty_second_snippet_runs_as_printed(tmp_path: Path) -> None:
 
 
 def test_the_event_loop_snippet_runs_as_printed(tmp_path: Path) -> None:
-    """The third block: the same two calls, awaited."""
-    snippet = programs()[2]
-    assert "zudb.aio.connect" in snippet and "asyncio.run" in snippet
+    """The same two calls, awaited."""
+    snippet = program_with("zudb.aio.connect", "asyncio.run")
     done = run(snippet, tmp_path)
     assert done.returncode == 0, done.stderr
     assert done.stdout.split() == ["ada"]
 
 
 def test_the_dbapi_snippet_runs_as_printed(tmp_path: Path) -> None:
-    """The fourth block: a cursor, a `?` parameter, a block that commits."""
-    snippet = programs()[3]
-    assert "zudb.dbapi.connect" in snippet and "fetchall" in snippet
+    """A cursor, a `?` parameter, a block that commits."""
+    snippet = program_with("zudb.dbapi.connect", "fetchall")
     done = run(snippet, tmp_path)
     assert done.returncode == 0, done.stderr
     assert done.stdout.strip() == "[('ada',)]"
@@ -102,3 +110,13 @@ def test_every_whole_program_in_the_readme_runs(index: int, tmp_path: Path) -> N
     """Including the ones no other test looks at the output of."""
     done = run(programs()[index], tmp_path)
     assert done.returncode == 0, done.stderr
+
+
+def test_the_snippet_with_no_path_leaves_the_directory_empty(tmp_path: Path) -> None:
+    """The claim the section makes is the one worth testing: a reader
+    who runs it finds nothing beside them afterwards."""
+    snippet = program_with("zudb.connect()")
+    done = run(snippet, tmp_path)
+    assert done.returncode == 0, done.stderr
+    assert done.stdout.strip() == "[('ada',)]"
+    assert list(tmp_path.iterdir()) == []

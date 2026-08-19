@@ -29,13 +29,13 @@ __abi_version__: str
 __engine_version__: str
 
 def connect(
-    path: str | os.PathLike[str],
+    path: str | os.PathLike[str] | None = None,
     *,
     read_only: bool = False,
     memory_limit: int | None = None,
     threads: int | None = None,
 ) -> Connection:
-    """Opens the database at `path` and connects to it."""
+    """Opens the database at `path`, or in memory when there is none."""
 
 def load(
     path: str | os.PathLike[str],
@@ -54,6 +54,10 @@ class Connection:
     @property
     def path(self) -> pathlib.Path:
         """The file this connection was opened on."""
+
+    @property
+    def memory(self) -> bool:
+        """Whether the database behind it is in memory."""
 
     @property
     def read_only(self) -> bool:

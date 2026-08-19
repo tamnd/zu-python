@@ -33,6 +33,20 @@ The interesting parts:
 - **`import zudb` costs about 4 ms** on this machine and is gated at 50, and pandas, polars and pyarrow are imported when you ask for one and not before. Importing pandas costs 700 ms, which is most of why none of them is a dependency.
 - **Graph values are real classes.** `Node`, `Rel`, and `Path` have `.labels`, `.id`, `.properties`, and an HTML repr. Not dicts, because a dict cannot tell a property named `labels` apart from the label set.
 
+## A database with no file
+
+`connect()` with nothing after it is a database in memory, and it makes no file anywhere.
+
+```python
+import zudb
+
+with zudb.connect() as conn:
+    conn.execute("INSERT (p:person {uid: 1, name: 'ada'})")
+    print(conn.execute("MATCH (p:person) RETURN p.name AS name").fetchall())
+```
+
+`connect(":memory:")` is the same thing spelled the way every embedded database spells it, and it no longer makes a file called `:memory:`, which is what it used to do and which was the worst of both worlds. It is the whole engine and not a reduced one: writes, transactions, the appender, `register`, streams, all of it, on bytes that are not a file. `conn.memory` says which kind you have, since `path` cannot quite answer it on a filesystem that allows a colon in a name. Nothing survives the last connection, which is the point: a notebook cell, a test, or five minutes with the language costs no cleanup and leaves no `social.zu1` in a directory somebody has to notice later.
+
 ## Building a graph
 
 A statement writes one row at a time, which is the wrong shape for loading data and cannot make a rel table at all. `load` is the other shape: a table's columns whole, the edges between them whole, one file written once.

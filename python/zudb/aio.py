@@ -83,7 +83,7 @@ _NOTHING = object()
 
 
 def connect(
-    path: str | os.PathLike[str],
+    path: str | os.PathLike[str] | None = None,
     *,
     read_only: bool = False,
     memory_limit: int | None = None,
@@ -93,8 +93,9 @@ def connect(
 
     The arguments are `zudb.connect`'s, and so is the behaviour: a path
     holding nothing becomes a new database unless the connection is
-    read-only. Opening reads the file, so it happens on the connection's
-    own thread like everything else.
+    read-only, and no path at all, or `":memory:"`, is a database in
+    memory that makes no file. Opening reads the file, so it happens on
+    the connection's own thread like everything else.
 
     Await it for a connection to close yourself, or open it with `async
     with` for one that closes at the end of the block:
@@ -115,7 +116,7 @@ def connect(
 
 
 async def _open(
-    path: str | os.PathLike[str],
+    path: str | os.PathLike[str] | None,
     *,
     read_only: bool,
     memory_limit: int | None,
@@ -202,6 +203,11 @@ class AsyncConnection:
     def path(self) -> pathlib.Path:
         """The file this connection was opened on."""
         return self._conn.path
+
+    @property
+    def memory(self) -> bool:
+        """Whether the database behind it is in memory."""
+        return self._conn.memory
 
     @property
     def read_only(self) -> bool:

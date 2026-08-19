@@ -174,11 +174,34 @@ def test_a_profile_is_what_the_operators_really_did(social: zudb.Connection) -> 
     assert scan.pulls == 1
     assert scan.rows == 3
     assert scan.flat == 3
-    assert scan.estimate == 3
-    # The optimizer was right about a table it has the statistics for,
-    # which is what a q-error of one means.
-    assert scan.qerror == 1
+    # The estimate comes off the catalog's summary of the table, and
+    # rows written without folding the file have not reached it yet, so
+    # a table three statements old estimates low. That is the engine's
+    # to answer and is recorded there; what this client owes is that
+    # the number and the q-error derived from it arrive at all.
+    assert scan.estimate is not None and scan.estimate > 0
+    assert scan.qerror == pytest.approx(scan.rows / scan.estimate)
     assert scan.nanos > 0
+
+
+def test_the_estimate_is_the_catalog_summary_once_the_file_holds_it(
+    tmp_path: Path,
+) -> None:
+    """Reopened, the same table estimates what it holds.
+
+    Written down because the difference between this and the profile
+    above is a real one a reader would otherwise take for noise.
+    """
+    path = tmp_path / "estimated.zu1"
+    with zudb.connect(path) as conn:
+        conn.execute("INSERT (p:person {uid: 1, name: 'ada'})")
+        conn.execute("INSERT (p:person {uid: $uid, name: $name})", {"uid": 2, "name": "grace"})
+    with zudb.connect(path) as conn:
+        run = conn.profile("MATCH (p:person) RETURN p.name AS name")
+        scan = next(op for op in run.stages[0].ops if op.op == "Scan")
+        assert scan.rows == 2
+        assert scan.estimate == 2
+        assert scan.qerror == 1
 
 
 def test_an_operator_the_optimizer_had_nothing_to_say_about_carries_none(

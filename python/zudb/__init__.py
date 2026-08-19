@@ -9,7 +9,8 @@
 
 The engine is compiled into the wheel, so there is nothing to install,
 nothing to run, and no server to connect to. Statements are ISO/IEC
-39075 GQL.
+39075 GQL. `connect()` with no path is a database in memory, which
+makes no file anywhere and is gone when the last connection to it is.
 
 On an event loop the same calls are awaited, from `zudb.aio`. Code
 written against PEP 249 gets what it expects from `zudb.dbapi`. Both

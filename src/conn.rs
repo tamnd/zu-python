@@ -8,7 +8,7 @@
 //! a program which shares one by accident waits rather than corrupts.
 
 use std::ffi::CStr;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 
@@ -92,6 +92,11 @@ pub struct Connection {
     path: PathBuf,
     #[pyo3(get)]
     read_only: bool,
+    /// Whether the database behind it is in memory, which is the one
+    /// thing `path` cannot quite say: a file could be called
+    /// `:memory:` on any filesystem that allows a colon.
+    #[pyo3(get)]
+    memory: bool,
 }
 
 #[pymethods]
@@ -439,15 +444,28 @@ impl Connection {
 }
 
 impl Connection {
+    /// The name a database in memory is asked for by, and answers to.
+    ///
+    /// The spelling every embedded database has used for thirty years,
+    /// which is the reason it is this and not something better: a
+    /// caller who types it has already been taught what it means
+    /// somewhere else.
+    const MEMORY: &'static str = ":memory:";
+
     /// Opens `path`, creating a database there when there is none.
     ///
     /// Creating is what every Python database module does and what a
     /// notebook expects, and it can only ever create where nothing
     /// was: a path that holds a database is opened, and a read-only
     /// connection never creates anything at all.
+    ///
+    /// No path, or `":memory:"`, is a database in memory. It used to
+    /// be a file called `:memory:` in the working directory, which was
+    /// the worst of both worlds: the name said nothing was on disk and
+    /// something was.
     pub fn open(
         py: Python<'_>,
-        path: PathBuf,
+        path: Option<PathBuf>,
         read_only: bool,
         memory_limit: Option<usize>,
         threads: Option<usize>,
@@ -459,9 +477,20 @@ impl Connection {
         if let Some(threads) = threads {
             config = config.threads(threads);
         }
-        let missing = !path.exists();
+        // The name is reported back as it was asked for rather than as
+        // the engine spells it. The engine mints a unique one per
+        // database so that two of them never share a writer, and that
+        // counter is its business and not a caller's.
+        let memory = path.as_deref().is_none_or(|p| p == Path::new(Self::MEMORY));
+        let path = match memory {
+            true => PathBuf::from(Self::MEMORY),
+            false => path.expect("a path that is not the memory name"),
+        };
+        let missing = !memory && !path.exists();
         let opened = py.detach(|| {
-            if missing && !read_only {
+            if memory {
+                Database::memory_with(config.clone())
+            } else if missing && !read_only {
                 Database::create_with(&path, config.clone())
             } else {
                 Database::open_with(&path, config.clone())
@@ -470,6 +499,7 @@ impl Connection {
         });
         let opened = opened.map_err(|err| to_py_err(py, err))?;
         Ok(Connection {
+            memory,
             // Taken here, once, because every later reader of it wants
             // it while the connection is busy and taking it then would
             // mean waiting for the statement it is there to stop.
