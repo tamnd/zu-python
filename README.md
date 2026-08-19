@@ -250,6 +250,24 @@ The markup is a table, a stylesheet and no script, so it survives `nbconvert`, a
 
 IPython is not a dependency. It is what a notebook already has, and nothing here imports it until `%load_ext` does.
 
+## A second connection, made from the first
+
+`cursor()` is another connection to the same database, made from a connection rather than from a path. It is how a pool is written.
+
+```python
+import zudb
+
+with zudb.connect("social.zu1") as conn:
+    with conn.cursor() as other:
+        other.execute("MATCH (p:person) RETURN p.name AS name").fetchall()
+```
+
+`duplicate()` is the same call under the name that says what it does; `cursor()` is what every other embedded database calls it and a caller who learned the word elsewhere should not have to learn another one here. It forks off the database the connection already holds rather than opening the file again, so it costs a schema load and no path lookup, and it works on a database in memory, where there is no path to open a second time.
+
+The two are connections in every sense rather than two names for one. Each has its own prepared statements, its own caches and its own transaction, so a thread taking one from a pool is not in whatever transaction the last borrower left open, and closing one does not close the other. What they share is the write side: they queue behind each other to write and each sees what the other has committed, which is what two connections to one file have always done.
+
+On an event loop it is awaited, because forking reaches the engine, and the new connection gets a thread of its own, which is the point: one connection runs one statement at a time, so two results in flight means two connections. In `zudb.dbapi` the name is `duplicate()` alone, since `cursor()` there is the thing PEP 249 means by it, which shares its connection and its transaction rather than making new ones.
+
 ## Stopping a statement
 
 A statement that is running can be stopped two ways, and neither of them closes the connection: the session, its plans and its warm readers are all there afterwards, which is the whole difference between stopping a statement and starting again.
@@ -333,7 +351,7 @@ Half of this package is compiled, which is the one thing an inspection cannot se
 
 ## What works today
 
-The list above is what this client is for. What it does so far is the core of it: `connect`, `execute` and `sql` with named parameters, results that iterate and fetch, values as Python objects both ways including dates, times, datetimes and durations, `Node`, `Rel` and `Path` as classes, `load` for building a graph with edges in it, an appender for growing one, transactions as a context manager that commits at the end of a block and rolls back when it raises, every condition as an exception class carrying its code, its position and its documentation link, results as Arrow columns and as pandas and polars frames, `register` for putting a frame under a name a statement can match on and reading it where it lies, stubs inside the wheel with a gate that keeps them true, the GIL released around every statement, every load and every copy out, `Ctrl-C` and `interrupt()` stopping a statement without touching the connection under it, `zudb.aio` for the same calls awaited on an event loop, results, nodes, rels and paths that draw themselves in a notebook with `%gql` and `%%gql` to run statements in one, `zudb.dbapi` for code written against PEP 249, `prepare`, `explain` and `profile` for a statement compiled once, the plan it would run and the plan it did, and `stream` for a result read as the engine makes it rather than after it has made all of it. Each one landed with the tests that say it works.
+The list above is what this client is for. What it does so far is the core of it: `connect`, `execute` and `sql` with named parameters, results that iterate and fetch, values as Python objects both ways including dates, times, datetimes and durations, `Node`, `Rel` and `Path` as classes, `load` for building a graph with edges in it, an appender for growing one, transactions as a context manager that commits at the end of a block and rolls back when it raises, every condition as an exception class carrying its code, its position and its documentation link, results as Arrow columns and as pandas and polars frames, `register` for putting a frame under a name a statement can match on and reading it where it lies, stubs inside the wheel with a gate that keeps them true, the GIL released around every statement, every load and every copy out, `Ctrl-C` and `interrupt()` stopping a statement without touching the connection under it, `zudb.aio` for the same calls awaited on an event loop, results, nodes, rels and paths that draw themselves in a notebook with `%gql` and `%%gql` to run statements in one, `zudb.dbapi` for code written against PEP 249, `prepare`, `explain` and `profile` for a statement compiled once, the plan it would run and the plan it did, `stream` for a result read as the engine makes it rather than after it has made all of it, and `cursor()` for a second connection made from the first, which is how a pool is written. Each one landed with the tests that say it works.
 
 ## Wheels
 

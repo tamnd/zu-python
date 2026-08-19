@@ -530,3 +530,35 @@ def test_connect_with_no_path_is_a_database_in_memory(
         cur.execute("MATCH (p:person) RETURN p.name AS n")
         assert cur.fetchall() == [("ada",)]
     assert list(tmp_path.iterdir()) == []
+
+
+def test_duplicate_is_another_connection_and_cursor_is_not() -> None:
+    """The two words this layer has to keep apart: a cursor shares the
+    connection it came from, and a duplicate is a connection of its
+    own."""
+    with dbapi.connect() as conn:
+        cur = conn.cursor()
+        cur.execute("INSERT (p:person {uid: 1, name: 'ada'})")
+        conn.commit()
+        other = conn.duplicate()
+        assert other is not conn
+        assert other.zu is not conn.zu
+        theirs = other.cursor()
+        theirs.execute("MATCH (p:person) RETURN p.name AS n")
+        assert theirs.fetchall() == [("ada",)]
+        other.close()
+        assert conn.closed is False
+
+
+def test_a_duplicate_carries_autocommit_and_not_the_transaction() -> None:
+    with dbapi.connect(autocommit=True) as conn:
+        other = conn.duplicate()
+        assert other.autocommit is True
+        other.close()
+
+
+def test_a_closed_connection_duplicates_nothing() -> None:
+    conn = dbapi.connect()
+    conn.close()
+    with pytest.raises(dbapi.InterfaceError, match="closed"):
+        conn.duplicate()

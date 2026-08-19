@@ -711,10 +711,37 @@ class Connection:
         return self._conn.closed
 
     def cursor(self) -> Cursor:
-        """A new cursor on this connection."""
+        """A new cursor on this connection.
+
+        PEP 249's cursor, which shares this connection and this
+        transaction with every other cursor taken from it. The call
+        that gives back a second connection instead is `duplicate`,
+        and the two are worth telling apart: cursors here are a way of
+        reading several results at once, not a way of running several
+        statements at once.
+        """
         if self.closed:
             raise InterfaceError("this connection is closed")
         return Cursor(self)
+
+    def duplicate(self) -> Connection:
+        """Another connection to the same database, made from this one.
+
+        This is how a pool is written, and it is what the native
+        client spells `cursor()`, after the way every other embedded
+        database spells it. That name is taken here by the thing PEP
+        249 means by it, so this one says what it does.
+
+        The new connection has a transaction of its own and starts
+        outside one, whatever this connection is in the middle of. It
+        carries this connection's `autocommit`, since a pool handing
+        out connections that behaved differently from the one it was
+        seeded with would be a trap.
+        """
+        if self.closed:
+            raise InterfaceError("this connection is closed")
+        with _translating():
+            return Connection(self._conn.cursor(), autocommit=self._autocommit)
 
     def commit(self) -> None:
         """Keeps what the transaction wrote and ends it.

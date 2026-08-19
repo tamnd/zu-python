@@ -71,7 +71,7 @@ def run(program: str, where: Path) -> subprocess.CompletedProcess[str]:
 
 def test_the_readme_prints_programs_and_not_fragments() -> None:
     """The rule above holds: the page has both kinds and knows which."""
-    assert len(programs()) == 5, "the README's whole programs"
+    assert len(programs()) == 6, "the README's whole programs"
     assert len(blocks("python")) > len(programs()), "and its fragments"
 
 
@@ -120,3 +120,12 @@ def test_the_snippet_with_no_path_leaves_the_directory_empty(tmp_path: Path) -> 
     assert done.returncode == 0, done.stderr
     assert done.stdout.strip() == "[('ada',)]"
     assert list(tmp_path.iterdir()) == []
+
+
+def test_the_cursor_snippet_runs_as_printed(tmp_path: Path) -> None:
+    """A second connection made from the first, on a database the
+    snippet creates as it goes."""
+    snippet = program_with("conn.cursor()", "as other")
+    done = run(snippet, tmp_path)
+    assert done.returncode == 0, done.stderr
+    assert (tmp_path / "social.zu1").is_file()

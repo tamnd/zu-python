@@ -373,6 +373,43 @@ class AsyncConnection:
         """
         return await self._call(lambda: self._conn.registered)
 
+    def cursor(self) -> _Opening[AsyncConnection]:
+        """Another connection to the same database, made from this one.
+
+            async with conn.cursor() as other:
+                rows = await other.execute("MATCH (p:person) RETURN p.name AS name")
+
+        This is how a pool is written, and on an event loop it is the
+        only way to have two statements in flight at once, since one
+        connection runs one statement at a time by design. It forks off
+        the database this connection already holds rather than opening
+        the file again, so it works on a database in memory, where
+        there is nothing to open a second time.
+
+        The new connection gets a thread of its own, which is the whole
+        point: two of them run at once. It gets its own prepared
+        statements, its own caches and its own transaction, and shares
+        only the write side, so the two queue behind each other to
+        write and each sees what the other has committed.
+
+        Closing this one does not close that one. Forking reaches the
+        engine, so it is awaited like everything else here.
+        """
+        return _Opening(self._cursor)
+
+    def duplicate(self) -> _Opening[AsyncConnection]:
+        """The same call as `cursor()`, under the name that says what
+        it does.
+        """
+        return _Opening(self._cursor)
+
+    async def _cursor(self) -> AsyncConnection:
+        made = await self._call(self._conn.cursor)
+        # A thread of its own, started here rather than by the engine
+        # call, so that a fork that failed leaves no thread behind.
+        pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix="zudb aio")
+        return AsyncConnection(made, pool)
+
     async def close(self) -> None:
         """Closes the connection, frees what it held, and ends the
         thread it ran on.
