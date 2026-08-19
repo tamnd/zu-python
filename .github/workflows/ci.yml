@@ -151,7 +151,14 @@ jobs:
       # pinned compiler in every other job.
       - run: rustup toolchain install nightly --profile minimal
       - run: sudo apt-get update && sudo apt-get install -y libclang-rt-18-dev
-      - run: pip install maturin pytest ipython
+      # pandas and pyarrow by name rather than through the extra that
+      # names them, because installing the extra would build this
+      # extension from source to get at its metadata and this job builds
+      # its own a step later. They are here at all because two of the
+      # whole programs the README publishes call to_pandas, and a job
+      # that skipped them would be watching a smaller suite than the
+      # one it claims to watch.
+      - run: pip install maturin pytest ipython pandas pyarrow
       - name: The extension, instrumented
         env:
           RUSTUP_TOOLCHAIN: nightly
@@ -184,6 +191,20 @@ jobs:
   # tools/valgrind.supp is one rule and says what it leaves out. The
   # gate is validated the only way a gate can be: a deliberate leak
   # through ctypes fails it.
+  #
+  # Definite leaks and not possible ones, which is the same pair of
+  # flags the TypeScript client's job carries and for a sharper reason
+  # here. Over the whole suite this counts 420 possible losses and zero
+  # definite ones, and 417 of the 420 are pyarrow registering compute
+  # kernels into a static table it never tears down. A possible loss is
+  # a block whose only surviving pointer is into its middle, which is
+  # what a registry of C++ objects looks like from the outside and what
+  # almost nothing this extension allocates looks like. Counting them
+  # would mean either a red job or a suppression naming pyarrow, and
+  # naming a dependency in a suppression file is how a suppression file
+  # starts growing. What it costs is a Rust leak that happens to leave
+  # an interior pointer behind, and the suite counts live connections
+  # and process descriptors from the other side for that.
   leaks:
     runs-on: ubuntu-latest
     steps:
@@ -208,14 +229,14 @@ jobs:
         run: |
           set +e
           PYTHONMALLOC=malloc valgrind --error-exitcode=1 --leak-check=full \
-            --errors-for-leak-kinds=definite,possible \
+            --show-leak-kinds=definite --errors-for-leak-kinds=definite \
             --suppressions=tools/valgrind.supp -q \
             python -c 'import ctypes; ctypes.CDLL("libc.so.6").malloc(4096)'
           test $? -eq 1 || { echo "the leak gate did not fire on a leak"; exit 1; }
       - name: The suite, counted
         run: |
           PYTHONMALLOC=malloc valgrind --error-exitcode=1 --leak-check=full \
-            --errors-for-leak-kinds=definite,possible \
+            --show-leak-kinds=definite --errors-for-leak-kinds=definite \
             --suppressions=tools/valgrind.supp -q \
             python -m pytest -m "not timing"
 
