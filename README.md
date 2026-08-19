@@ -221,6 +221,12 @@ The wheel carries `py.typed` and a stub for the compiled module, so mypy, pyrigh
 
 The stub is checked against the module it describes in CI: griffe reads the stub as text and the installed extension by inspection, and the two have to agree on every name, every parameter and every default. A stub is a promise no interpreter checks, so something has to.
 
+## Reference
+
+Every name, its signature and what its docstring says, generated from the installed package rather than written by hand beside it. The release builds it from the wheel it is about to publish, so the pages describe that wheel and not the checkout it came out of, and `python tools/reference.py <directory>` builds the same pages here.
+
+Half of this package is compiled, which is the one thing an inspection cannot see through: `zudb.connect` is a function object pyo3 built, and its types live in `_zudb.pyi` where the checkers read them. So the stub is laid where the generator looks for one, and the build fails if it stops landing, because a reference that quietly lost every annotation is a reference that still builds and is wrong about every signature on the page.
+
 ## What works today
 
 The list above is what this client is for. What it does so far is the core of it: `connect`, `execute` and `sql` with named parameters, results that iterate and fetch, values as Python objects both ways including dates, times, datetimes and durations, `Node`, `Rel` and `Path` as classes, `load` for building a graph with edges in it, an appender for growing one, transactions as a context manager that commits at the end of a block and rolls back when it raises, every condition as an exception class carrying its code, its position and its documentation link, results as Arrow columns and as pandas and polars frames, `register` for putting a frame under a name a statement can match on and reading it where it lies, stubs inside the wheel with a gate that keeps them true, the GIL released around every statement, every load and every copy out, `Ctrl-C` and `interrupt()` stopping a statement without touching the connection under it, `zudb.aio` for the same calls awaited on an event loop, results, nodes, rels and paths that draw themselves in a notebook with `%gql` and `%%gql` to run statements in one, and `zudb.dbapi` for code written against PEP 249. Each one landed with the tests that say it works.
