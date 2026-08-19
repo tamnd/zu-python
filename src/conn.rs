@@ -22,6 +22,8 @@ use crate::columns;
 use crate::error::{closed, programming, to_py_err};
 use crate::html;
 use crate::interrupt;
+use crate::plan;
+use crate::prepared::Prepared;
 use crate::register;
 use crate::txn::Transaction;
 use crate::value::{Names, from_py, to_py};
@@ -30,6 +32,17 @@ use crate::value::{Names, from_py, to_py};
 /// of the protocol: a consumer checks it before it reads the pointer,
 /// and a capsule named anything else is not one of these.
 const STREAM: &CStr = c"arrow_array_stream";
+
+/// What a run is: the text of a statement, or the id the session pinned
+/// a prepared one under.
+///
+/// One enum rather than two paths, so that a prepared statement gets
+/// the interrupt handling, the GIL release and the catalog names that
+/// every other statement gets, by being the same call.
+pub(crate) enum Source {
+    Text(String),
+    Prepared(u64),
+}
 
 /// One connection to one database.
 ///
@@ -102,6 +115,76 @@ impl Connection {
         params: Option<&Bound<'_, PyDict>>,
     ) -> PyResult<Result> {
         self.execute(py, statement, params)
+    }
+
+    /// Compiles a statement now and hands back something that runs it
+    /// later, as often as you like, with different values bound each
+    /// time.
+    ///
+    /// ```python
+    /// with conn.prepare("MATCH (p:person) WHERE p.name = $name RETURN p.id AS id") as find:
+    ///     rows = find.execute({"name": "ada"})
+    /// ```
+    ///
+    /// It is not the speedup the word usually promises, and the class
+    /// says why at length: there is no round trip to save here, and the
+    /// engine already caches a plan by the text of the statement. What
+    /// it buys is the compile happening at this line, at startup, and
+    /// `params` coming back.
+    fn prepare(slf: Py<Self>, py: Python<'_>, statement: &str) -> PyResult<Prepared> {
+        Prepared::compile(py, slf, statement)
+    }
+
+    /// What the statement would do, without doing it.
+    ///
+    /// ```python
+    /// print(conn.explain("MATCH (p:person) RETURN p.name AS name"))
+    /// ```
+    ///
+    /// The plan comes back as the engine's own listing, which is what
+    /// `print` gives, and as a tree of operators, which is what
+    /// `plan.root` walks. It takes no parameters: a plan is chosen from
+    /// the shape of the statement rather than from the values bound to
+    /// it, and one asked for with values would suggest otherwise.
+    fn explain(&self, py: Python<'_>, statement: &str) -> PyResult<plan::Plan> {
+        let out = self
+            .engine(py, |conn| conn.explain_plan(statement))?
+            .map_err(|err| to_py_err(py, err))?;
+        plan::planned(py, &out)
+    }
+
+    /// Runs the statement with the counters on and answers what its
+    /// operators really did.
+    ///
+    /// ```python
+    /// run = conn.profile("MATCH (p:person)-[:knows]->(q:person) RETURN q.name AS name")
+    /// print(run)
+    /// ```
+    ///
+    /// Beside every operator's rows is what the optimizer thought it
+    /// would produce, so the operator that surprised it is the one to
+    /// look at. A statement that writes is refused rather than
+    /// profiled, because a measurement that also inserted two rows
+    /// changed the thing it was measuring.
+    #[pyo3(signature = (statement, params = None))]
+    fn profile(
+        &self,
+        py: Python<'_>,
+        statement: &str,
+        params: Option<&Bound<'_, PyDict>>,
+    ) -> PyResult<plan::Profile> {
+        let params = bind(params)?;
+        let statement = statement.to_string();
+        let out = interrupt::watched(py, &self.runner, &self.inner, &self.stop, move |conn| {
+            let borrowed: Vec<(&str, Value)> = params
+                .iter()
+                .map(|(name, value)| (name.as_str(), value.clone()))
+                .collect();
+            conn.profile(&statement, &borrowed)
+        })
+        .map_err(|stopped| stopped.raise(py))?
+        .map_err(|err| to_py_err(py, err))?;
+        plan::profiled(py, &out)
     }
 
     /// Starts a transaction and hands it back for a `with` block.
@@ -358,7 +441,41 @@ impl Connection {
         // statement is not this one and the borrow would have to say
         // so. It is one allocation against a statement, which is
         // nothing beside the parse it is about to have.
-        let statement = statement.to_string();
+        self.run_source(py, Source::Text(statement.to_string()), params)
+    }
+
+    /// Runs a statement the session has already compiled, under the id
+    /// it pinned it with.
+    ///
+    /// The same path as every other statement, so a prepared one
+    /// releases the GIL, queues for the connection's lock and feels a
+    /// `Ctrl-C` exactly as one written out does.
+    pub(crate) fn query_prepared(
+        &self,
+        py: Python<'_>,
+        id: u64,
+        params: Vec<(String, Value)>,
+    ) -> PyResult<Result> {
+        self.run_source(py, Source::Prepared(id), params)
+    }
+
+    /// Gives a prepared statement's id back to the session.
+    ///
+    /// Every reason the connection could not be had is ignored, since
+    /// they all mean the same thing here: a session that is gone is not
+    /// holding the statement either.
+    pub(crate) fn release(&self, py: Python<'_>, id: u64) {
+        let _ = self.engine(py, |conn| -> std::result::Result<bool, ()> {
+            Ok(conn.close_prepared(id))
+        });
+    }
+
+    fn run_source(
+        &self,
+        py: Python<'_>,
+        source: Source,
+        params: Vec<(String, Value)>,
+    ) -> PyResult<Result> {
         // The GIL goes down for the whole statement, waiting for the
         // connection's own lock included. That is the point of a
         // compiled engine in a Python process: another thread runs
@@ -373,8 +490,11 @@ impl Connection {
                     .map(|(name, value)| (name.as_str(), value.clone()))
                     .collect();
                 let names = Names::of(conn.session_mut().catalog());
-                conn.query_with(&statement, &borrowed)
-                    .map(|result| (result, names))
+                let out = match &source {
+                    Source::Text(statement) => conn.query_with(statement, &borrowed),
+                    Source::Prepared(id) => conn.execute_prepared(*id, &borrowed),
+                };
+                out.map(|result| (result, names))
             })
             .map_err(|stopped| stopped.raise(py))?
             .map_err(|err| to_py_err(py, err))?;
@@ -649,7 +769,7 @@ fn needed<'py>(py: Python<'py>, module: &str, extra: &str) -> PyResult<Bound<'py
 }
 
 /// The parameter dictionary as the engine takes it.
-fn bind(params: Option<&Bound<'_, PyDict>>) -> PyResult<Vec<(String, Value)>> {
+pub(crate) fn bind(params: Option<&Bound<'_, PyDict>>) -> PyResult<Vec<(String, Value)>> {
     let Some(params) = params else {
         return Ok(Vec::new());
     };

@@ -49,10 +49,16 @@ from concurrent.futures import Future, ThreadPoolExecutor
 from typing import Any, Generic, TypeVar
 
 from . import _zudb
-from ._zudb import Appender, Connection, Result, Transaction
+from ._zudb import Appender, Connection, Plan, Prepared, Profile, Result, Transaction
 from .types import Value
 
-__all__ = ["connect", "AsyncConnection", "AsyncTransaction", "AsyncAppender"]
+__all__ = [
+    "connect",
+    "AsyncConnection",
+    "AsyncTransaction",
+    "AsyncAppender",
+    "AsyncPrepared",
+]
 
 T = TypeVar("T")
 
@@ -216,6 +222,35 @@ class AsyncConnection:
     async def sql(self, statement: str, params: Mapping[str, Value] | None = None) -> Result:
         """The same call, named for the way it reads in a notebook."""
         return await self._call(functools.partial(self._conn.sql, statement, params))
+
+    def prepare(self, statement: str) -> _Opening[AsyncPrepared]:
+        """Compiles a statement now and hands back something that runs
+        it later, as often as you like.
+
+            statement = "MATCH (p:person) WHERE p.name = $name RETURN p.id AS id"
+            async with conn.prepare(statement) as find:
+                rows = await find.execute({"name": "ada"})
+
+        Compiling reaches the engine, so it is awaited like everything
+        else here, and what it buys is what the sync client's docstring
+        says it buys: the compile at this line rather than at the first
+        request, and the names the statement wants.
+        """
+        return _Opening(functools.partial(self._prepare, statement))
+
+    async def _prepare(self, statement: str) -> AsyncPrepared:
+        compiled = await self._call(functools.partial(self._conn.prepare, statement))
+        return AsyncPrepared(self, compiled)
+
+    async def explain(self, statement: str) -> Plan:
+        """What the statement would do, without doing it."""
+        return await self._call(functools.partial(self._conn.explain, statement))
+
+    async def profile(self, statement: str, params: Mapping[str, Value] | None = None) -> Profile:
+        """Runs the statement with the counters on and answers what its
+        operators really did.
+        """
+        return await self._call(functools.partial(self._conn.profile, statement, params))
 
     def transaction(self, *, read_only: bool = False) -> _Opening[AsyncTransaction]:
         """Starts a transaction and hands it back for an `async with`
@@ -496,3 +531,69 @@ class AsyncAppender:
 
     def __repr__(self) -> str:
         return f"<zudb.aio.AsyncAppender {self.table}>"
+
+
+class AsyncPrepared:
+    """A statement the engine has compiled and is holding for you.
+
+    The prepared statement underneath is `zudb.Prepared` and the rules
+    are its rules: running one that has been closed is refused, closing
+    twice does nothing, and a run that binds no value the statement
+    wants fails at the run rather than at the compile.
+    """
+
+    __slots__ = ("_conn", "_prepared")
+
+    def __init__(self, conn: AsyncConnection, prepared: Prepared) -> None:
+        self._conn = conn
+        self._prepared = prepared
+
+    @property
+    def statement(self) -> str:
+        """The text it was compiled from."""
+        return self._prepared.statement
+
+    @property
+    def params(self) -> list[str]:
+        """The names this statement wants bound, in the order it uses
+        them.
+
+        A property rather than a coroutine, unlike most of what is here:
+        the names were read at the compile and are held beside the id,
+        so asking for them reaches nothing that could wait.
+        """
+        return self._prepared.params
+
+    @property
+    def closed(self) -> bool:
+        """Whether this prepared statement has been closed."""
+        return self._prepared.closed
+
+    async def execute(self, params: Mapping[str, Value] | None = None) -> Result:
+        """Runs it with these parameters and gives back its rows."""
+        return await self._conn._call(functools.partial(self._prepared.execute, params))
+
+    async def sql(self, params: Mapping[str, Value] | None = None) -> Result:
+        """The same call, named for the way it reads in a notebook."""
+        return await self._conn._call(functools.partial(self._prepared.sql, params))
+
+    async def close(self) -> None:
+        """Closes it and gives the statement back to the connection."""
+        await self._conn._call(self._prepared.close)
+
+    async def __aenter__(self) -> AsyncPrepared:
+        return self
+
+    async def __aexit__(self, *_exception: Any) -> bool:
+        """Closes on the way out, whether the block ended well or badly.
+
+        There is nothing to undo and nothing to write, so unlike a
+        transaction's exit this one has only the one thing it could
+        mean.
+        """
+        await self.close()
+        return False
+
+    def __repr__(self) -> str:
+        closed = ", closed" if self.closed else ""
+        return f"<zudb.aio.AsyncPrepared {self.statement!r}{closed}>"
