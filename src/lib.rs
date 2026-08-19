@@ -21,6 +21,7 @@ mod frame;
 mod html;
 mod interrupt;
 mod load;
+mod numpy;
 mod plan;
 mod prepared;
 mod register;

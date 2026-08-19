@@ -153,7 +153,7 @@ def nothing_else_installed() -> None:
     """
     import zudb
 
-    for module in ("pandas", "polars", "pyarrow"):
+    for module in ("numpy", "pandas", "polars", "pyarrow"):
         assert module not in sys.modules, f"{module} was imported by importing zudb"
 
     with tempfile.TemporaryDirectory() as where:
@@ -165,6 +165,16 @@ def nothing_else_installed() -> None:
                 assert "zudb[pandas]" in str(refusal), refusal
             else:
                 raise AssertionError("to_pandas worked without pandas")
+
+            # The extension links numpy's C API, which is the one of
+            # these that could plausibly be needed at import time and
+            # is not.
+            try:
+                rows.fetchnumpy()
+            except ImportError as refusal:
+                assert "zudb[numpy]" in str(refusal), refusal
+            else:
+                raise AssertionError("fetchnumpy worked without numpy")
 
 
 def main() -> int:

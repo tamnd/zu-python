@@ -132,6 +132,27 @@ def test_the_dbapi_module_is_not_imported_by_importing_this_one() -> None:
     assert done.stdout.strip() == "False"
 
 
+def test_numpy_arrives_when_a_result_is_asked_for_its_arrays(tmp_path: Path) -> None:
+    """The extension links numpy's C API and still does not import it.
+
+    It is loaded at the first array and not at module init, which is the
+    difference between a client that costs numpy to import and one that
+    costs it to use.
+    """
+    pytest.importorskip("numpy")
+    path = tmp_path / "arrays.zu1"
+    done = run(
+        "import sys, zudb\n"
+        f"zudb.load({str(path)!r}, nodes='person', columns={{'uid': [1, 2, 3]}})\n"
+        f"conn = zudb.connect({str(path)!r}, read_only=True)\n"
+        "result = conn.execute('MATCH (p:person) RETURN p.uid AS uid')\n"
+        "print('before', 'numpy' in sys.modules)\n"
+        "arrays = result.fetchnumpy()\n"
+        "print('after', 'numpy' in sys.modules, len(arrays['uid']))\n"
+    )
+    assert done.stdout.splitlines() == ["before False", "after True 3"]
+
+
 def test_pyarrow_arrives_when_a_result_is_asked_for_its_columns(tmp_path: Path) -> None:
     pytest.importorskip("pyarrow")
     path = tmp_path / "columns.zu1"
