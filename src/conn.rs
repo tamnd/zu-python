@@ -356,6 +356,48 @@ impl Connection {
         register::registered(py, self)
     }
 
+    /// Another connection to the same database, made from this one.
+    ///
+    /// This is how a pool is written. `zudb.connect()` opens the file
+    /// again and looks the database up by path; this forks off the one
+    /// this connection already holds, which costs a schema load and no
+    /// lookup, and works on a database in memory, where there is no
+    /// path to open a second time.
+    ///
+    /// The two are connections in every sense rather than two names
+    /// for one. Each has its own prepared statements, its own caches
+    /// and its own transaction, so a thread that takes one from a pool
+    /// is not in whatever transaction the last borrower left open. What
+    /// they share is the write side: they queue behind each other to
+    /// write and each sees what the other has committed, which is what
+    /// two connections to one file have always done.
+    ///
+    /// `duplicate()` is the same call under the name that says what it
+    /// does. `cursor()` is what every other embedded database calls
+    /// it, and a caller who learned the word somewhere else should not
+    /// have to learn another one here.
+    fn cursor(&self, py: Python<'_>) -> PyResult<Connection> {
+        let made = self
+            .engine(py, |conn| conn.duplicate())?
+            .map_err(|err| to_py_err(py, err))?;
+        Ok(Connection {
+            stop: made.interrupt(),
+            inner: Arc::new(Mutex::new(Some(made))),
+            runner: OnceLock::new(),
+            alive: AtomicBool::new(true),
+            feeding: Arc::new(stream::Feeding::new()),
+            path: self.path.clone(),
+            read_only: self.read_only,
+            memory: self.memory,
+        })
+    }
+
+    /// The same call as `cursor()`, under the name that says what it
+    /// does rather than the name every embedded database uses for it.
+    fn duplicate(&self, py: Python<'_>) -> PyResult<Connection> {
+        self.cursor(py)
+    }
+
     /// Asks the statement running on this connection to stop.
     ///
     /// The one call meant to be made from another thread while the

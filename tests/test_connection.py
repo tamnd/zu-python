@@ -138,3 +138,58 @@ def test_a_database_on_disk_is_not_one_in_memory(tmp_path: Path) -> None:
 def test_a_database_in_memory_cannot_be_read_only() -> None:
     with pytest.raises(zudb.Error):
         zudb.connect(read_only=True)
+
+
+def test_a_cursor_is_another_connection_to_the_same_database() -> None:
+    """The pool case, on a database in memory because that is the one
+    with no path to reopen: nothing but the shared write side could be
+    carrying the rows."""
+    with zudb.connect() as conn:
+        conn.execute("INSERT (p:person {uid: 1, name: 'ada'})")
+        with conn.cursor() as other:
+            assert other.execute("MATCH (p:person) RETURN p.name AS n").fetchall() == [("ada",)]
+            other.execute("INSERT (p:person {uid: 2, name: 'grace'})")
+        assert conn.execute("MATCH (p:person) RETURN count(*) AS n").fetchall() == [(2,)]
+
+
+def test_duplicate_is_the_same_call_under_the_other_name(tmp_path: Path) -> None:
+    with zudb.connect(tmp_path / "pooled.zu1") as conn:
+        conn.execute("INSERT (p:person {uid: 1, name: 'ada'})")
+        with conn.duplicate() as other:
+            assert other.execute("MATCH (p:person) RETURN p.name AS n").fetchall() == [("ada",)]
+
+
+def test_a_cursor_says_what_the_connection_it_came_from_says(tmp_path: Path) -> None:
+    path = tmp_path / "said.zu1"
+    zudb.connect(path).close()
+    with zudb.connect(path, read_only=True) as conn, conn.cursor() as other:
+        assert other.path == conn.path
+        assert other.read_only is True
+        assert other.memory is False
+        assert other.closed is False
+
+
+def test_a_cursor_outlives_the_connection_it_was_made_from() -> None:
+    """It is a connection and not a view of one, which is what makes a
+    pool able to hand its seed back."""
+    conn = zudb.connect()
+    conn.execute("INSERT (p:person {uid: 1, name: 'ada'})")
+    other = conn.cursor()
+    conn.close()
+    assert other.execute("MATCH (p:person) RETURN p.name AS n").fetchall() == [("ada",)]
+    other.close()
+
+
+def test_a_cursor_has_a_transaction_of_its_own() -> None:
+    with zudb.connect() as conn, conn.cursor() as other:
+        conn.execute("INSERT (p:person {uid: 1, name: 'ada'})")
+        with conn.transaction():
+            assert conn.in_transaction is True
+            assert other.in_transaction is False
+
+
+def test_a_closed_connection_makes_no_cursor() -> None:
+    conn = zudb.connect()
+    conn.close()
+    with pytest.raises(zudb.ProgrammingError, match="closed"):
+        conn.cursor()

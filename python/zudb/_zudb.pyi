@@ -71,6 +71,12 @@ class Connection:
     def rows_read(self) -> int:
         """How many rows the statement running on this connection has read out of storage."""
 
+    def cursor(self) -> Connection:
+        """Another connection to the same database, made from this one."""
+
+    def duplicate(self) -> Connection:
+        """The same call as `cursor()`, under the name that says what it does."""
+
     def interrupt(self) -> None:
         """Asks the statement running on this connection to stop."""
 

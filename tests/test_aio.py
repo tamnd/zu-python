@@ -507,3 +507,44 @@ async def test_connect_with_no_path_is_a_database_in_memory(
         rows = await conn.execute("MATCH (p:person) RETURN p.name AS n")
         assert rows.fetchall() == [("ada",)]
     assert list(tmp_path.iterdir()) == []
+
+
+@run
+async def test_a_cursor_is_another_connection_with_a_thread_of_its_own() -> None:
+    async with zudb.aio.connect() as conn:
+        await conn.execute("INSERT (p:person {uid: 1, name: 'ada'})")
+        async with conn.cursor() as other:
+            rows = await other.execute("MATCH (p:person) RETURN p.name AS n")
+            assert rows.fetchall() == [("ada",)]
+            await other.execute("INSERT (p:person {uid: 2, name: 'grace'})")
+        rows = await conn.execute("MATCH (p:person) RETURN count(*) AS n")
+        assert rows.fetchall() == [(2,)]
+
+
+@run
+async def test_two_connections_read_at_once_where_one_would_queue() -> None:
+    """The reason this call exists on an event loop: one connection
+    runs one statement at a time, so two results in flight means two
+    connections."""
+    async with zudb.aio.connect() as conn:
+        await conn.execute("INSERT (p:person {uid: 1, name: 'ada'})")
+        other = await conn.duplicate()
+        try:
+            both = await asyncio.gather(
+                conn.execute("MATCH (p:person) RETURN p.name AS n"),
+                other.execute("MATCH (p:person) RETURN p.name AS n"),
+            )
+            assert [rows.fetchall() for rows in both] == [[("ada",)], [("ada",)]]
+        finally:
+            await other.close()
+
+
+@run
+async def test_closing_one_leaves_the_other_open() -> None:
+    async with zudb.aio.connect() as conn:
+        await conn.execute("INSERT (p:person {uid: 1, name: 'ada'})")
+        other = await conn.cursor()
+        await conn.close()
+        rows = await other.execute("MATCH (p:person) RETURN p.name AS n")
+        assert rows.fetchall() == [("ada",)]
+        await other.close()
