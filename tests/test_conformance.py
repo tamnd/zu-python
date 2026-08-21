@@ -18,18 +18,21 @@ import math
 import os
 import subprocess
 import sys
+import tempfile
+from collections.abc import Iterator
 from pathlib import Path
 
 import pytest
 import zudb
 
-from conformance import cases, reader, runner, values
+from conformance import arrow, cases, reader, runner, values
+from conformance.cases import MAIN
 
 CASES = os.environ.get("ZU_CASES")
 
 needs_cases = pytest.mark.skipif(not CASES, reason="ZU_CASES does not point at the case files")
 
-HEAD = "schema: 3\nsuite: int\ndoc: the integer tower\n"
+HEAD = "schema: 4\nsuite: int\ndoc: the integer tower\n"
 
 
 def rows_of(value: str, ty: str = "INT64", column: str = "n") -> str:
@@ -318,6 +321,74 @@ def test_a_list_holds_encoded_values_and_not_bare_ones() -> None:
     assert value("type: LIST\nvalue:\n") == []
 
 
+def test_a_node_is_the_name_of_its_table_and_the_row_it_is() -> None:
+    assert value('type: NODE\nvalue: "person#1"\n') == zudb.Node("person", 1)
+    # The last hash is the separator, so a table whose name holds one is
+    # still read the way it was written.
+    assert value('type: NODE\nvalue: "a#b#2"\n') == zudb.Node("a#b", 2)
+
+
+def test_an_edge_is_read_without_the_field_no_case_writes() -> None:
+    """The engine's edge carries the position it holds among the edges
+    out of its source, which the loader chose and no case picked. It is
+    dropped on both sides rather than guessed at on one."""
+    assert value('type: EDGE\nvalue: "knows#0->1"\n') == values.Edge("knows", 0, 1)
+    assert values.cell(zudb.Rel("knows", 0, 1, 7)) == values.Edge("knows", 0, 1)
+
+
+def test_a_path_alternates_nodes_and_edges_and_has_to_start_and_end_on_a_node() -> None:
+    walk = value(
+        'type: PATH\nvalue:\n  - type: NODE\n    value: "person#0"\n'
+        '  - type: EDGE\n    value: "knows#0->1"\n  - type: NODE\n    value: "person#1"\n'
+    )
+    assert walk == values.Walk(
+        (zudb.Node("person", 0), values.Edge("knows", 0, 1), zudb.Node("person", 1))
+    )
+    # The one-node path is the shortest one there is, and it is a path.
+    assert value('type: PATH\nvalue:\n  - type: NODE\n    value: "person#0"\n') == values.Walk(
+        (zudb.Node("person", 0),)
+    )
+
+
+@pytest.mark.parametrize(
+    ("text", "want"),
+    [
+        ("type: NODE\nvalue: person#1\n", "is a name and two numbers"),
+        ("type: EDGE\nvalue: knows#0->1\n", "is a name and two numbers"),
+        ('type: NODE\nvalue: "person"\n', '"person" is not a NODE'),
+        ('type: NODE\nvalue: "person#x"\n', '"person#x" is not a NODE'),
+        ('type: NODE\nvalue: "#1"\n', '"#1" is not a NODE'),
+        ('type: EDGE\nvalue: "knows#0"\n', '"knows#0" is not a EDGE'),
+        ('type: EDGE\nvalue: "knows#a->b"\n', '"knows#a->b" is not a EDGE'),
+        ('type: EDGE\nvalue: "knows#0->"\n', '"knows#0->" is not a EDGE'),
+        (
+            'type: PATH\nvalue:\n  - type: NODE\n    value: "person#0"\n'
+            '  - type: EDGE\n    value: "knows#0->1"\n',
+            "an odd number",
+        ),
+        (
+            'type: PATH\nvalue:\n  - type: EDGE\n    value: "knows#0->1"\n'
+            '  - type: NODE\n    value: "person#0"\n  - type: EDGE\n    value: "knows#0->1"\n',
+            "alternates",
+        ),
+        ("type: PATH\nvalue:\n", "an odd number"),
+    ],
+)
+def test_a_graph_value_written_wrong_is_refused_where_it_is_written(text: str, want: str) -> None:
+    with pytest.raises(reader.CorpusError) as raised:
+        value(text)
+    assert want in str(raised.value)
+
+
+def test_a_graph_value_prints_the_way_a_case_writes_one() -> None:
+    assert values.show(zudb.Node("person", 1)) == 'NODE "person#1"'
+    assert values.show(values.Edge("knows", 0, 1)) == 'EDGE "knows#0->1"'
+    assert (
+        values.show(values.Walk((zudb.Node("person", 0), values.Edge("knows", 0, 1))))
+        == 'PATH [NODE "person#0", EDGE "knows#0->1"]'
+    )
+
+
 def test_a_type_the_engine_cannot_hold_yet_says_so_rather_than_looking_like_a_typo() -> None:
     with pytest.raises(reader.CorpusError) as raised:
         value('type: DECIMAL\nvalue: "1.00"\n')
@@ -492,7 +563,70 @@ def test_a_case_may_load_its_own_data_first() -> None:
         "    rows:\n      - values:\n          - type: STRING\n            value: a\n"
     )
     assert len(case.setup) == 2
-    assert case.setup[0].startswith("CREATE NODE TABLE")
+    assert case.setup[0].query.startswith("CREATE NODE TABLE")
+    # A setup written as a bare statement runs on the connection the case
+    # itself runs on, which is the one every case had before any of them
+    # named a second.
+    assert [step.on for step in case.setup] == [MAIN, MAIN]
+    assert case.on == MAIN
+
+
+def test_a_case_may_say_which_connection_it_runs_on() -> None:
+    case = one(
+        "  - name: on-another\n    doc: a case run from a second connection\n    setup:\n"
+        "      - CREATE NODE TABLE Person(name STRING)\n"
+        "      - on: writer\n        query: INSERT (:Person {name: 'a'})\n"
+        "    on: reader\n    query: MATCH (p:Person) RETURN p.name AS name\n"
+        "    columns:\n      - name\n    rows:\n      - values:\n"
+        "          - type: STRING\n            value: a\n"
+    )
+    assert [(step.on, step.query.split(" ")[0]) for step in case.setup] == [
+        (MAIN, "CREATE"),
+        ("writer", "INSERT"),
+    ]
+    assert case.on == "reader"
+
+
+def test_a_connection_is_named_the_way_everything_else_in_a_case_is() -> None:
+    """Lower case words joined by dashes, so that a report citing one
+    reads like the rest of a report and no client has to decide what to
+    do with a name another client would have written differently."""
+    case = one(
+        "  - name: a\n    doc: d\n    on: read-only-one\n    query: RETURN 1\n    raises: 22012\n"
+    )
+    assert case.on == "read-only-one"
+
+
+@pytest.mark.parametrize(
+    ("text", "want"),
+    [
+        ("    on: Writer\n", "lower case words joined by dashes"),
+        ("    on: a_b\n", "lower case words joined by dashes"),
+        ("    on:\n", "is the name of a connection"),
+        ("    on:\n      - a\n", "is the name of a connection"),
+    ],
+)
+def test_a_connection_written_wrong_is_refused_where_it_is_written(text: str, want: str) -> None:
+    with pytest.raises(reader.CorpusError) as raised:
+        suite(f"  - name: a\n    doc: d\n{text}    query: RETURN 1\n    raises: 22012\n")
+    assert want in str(raised.value)
+
+
+@pytest.mark.parametrize(
+    ("text", "want"),
+    [
+        ("      - query: RETURN 1\n", "names the connection it runs on"),
+        ("      - on: writer\n", "no `query:`"),
+        ("      - on: writer\n        stmt: RETURN 1\n", 'has no key "stmt"'),
+        ("      - on: Writer\n        query: RETURN 1\n", "lower case words joined by dashes"),
+    ],
+)
+def test_a_setup_step_written_as_a_mapping_says_both_halves(text: str, want: str) -> None:
+    with pytest.raises(reader.CorpusError) as raised:
+        suite(
+            f"  - name: a\n    doc: d\n    setup:\n{text}    query: RETURN 1\n    raises: 22012\n"
+        )
+    assert want in str(raised.value)
 
 
 def test_a_case_may_bind_parameters_and_they_keep_the_order_they_were_written_in() -> None:
@@ -580,7 +714,7 @@ def test_a_parameter_a_statement_could_not_name_is_refused_where_it_is_written(
 
 def test_a_suite_may_load_a_table_every_case_in_it_reads_back() -> None:
     read = cases.read(
-        "schema: 3\nsuite: int\ndoc: d\nload:\n  nodes: person\n  edges: knows\n  count: 1\n"
+        "schema: 4\nsuite: int\ndoc: d\nload:\n  nodes: person\n  edges: knows\n  count: 1\n"
         '  columns:\n    - name: age\n      type: INT64\n      values:\n        - "30"\n'
         "cases:\n  - name: a\n    doc: d\n    query: MATCH (p:person) RETURN p.age AS n\n"
         + rows_of("30")
@@ -671,7 +805,7 @@ def test_the_same_case_name_twice_is_refused_because_a_report_cites_names() -> N
 def test_a_file_from_another_schema_says_so_rather_than_failing_in_the_middle() -> None:
     with pytest.raises(reader.CorpusError) as raised:
         cases.read("schema: 1\nsuite: int\ndoc: d\ncases:\n  - name: a\n")
-    assert "schema 1 and the runner reads schema 3" in str(raised.value)
+    assert "schema 1 and the runner reads schema 4" in str(raised.value)
 
 
 def test_a_suite_whose_name_is_not_its_file_name_is_refused(tmp_path: Path) -> None:
@@ -693,6 +827,90 @@ def test_a_directory_with_no_case_files_is_refused_rather_than_passing_empty(
     assert "no case files" in str(raised.value)
 
 
+# What a case says about the export.
+
+
+def test_a_case_may_say_what_the_export_gives_field_by_field() -> None:
+    case = one(
+        "  - name: exported\n    doc: a statement whose export is the point\n"
+        "    query: RETURN 1 AS n\n    columns:\n      - n\n"
+        "    rows:\n      - values:\n          - type: INT8\n            value: 1\n"
+        "    arrow:\n      - name: n\n        format: l\n"
+    )
+    assert case.arrow == [arrow.Field("n", "l")]
+
+
+def test_a_nested_field_carries_the_fields_under_it() -> None:
+    case = one(
+        "  - name: exported\n    doc: a list of strings, which is a field inside a field\n"
+        "    query: RETURN ['a'] AS xs\n    columns:\n      - xs\n"
+        "    rows:\n      - values:\n          - type: LIST\n            value:\n"
+        "              - type: STRING\n                value: a\n"
+        "    arrow:\n      - name: xs\n        format: +l\n        children:\n"
+        "          - name: item\n            format: u\n"
+    )
+    assert case.arrow == [arrow.Field("xs", "+l", (arrow.Field("item", "u"),))]
+
+
+def test_a_result_arrow_has_no_type_for_is_written_as_a_refusal() -> None:
+    case = one(
+        "  - name: refused\n    doc: a time with an offset, which Arrow has no type for\n"
+        "    query: RETURN 1 AS n\n    raises: 22012\n    arrow: refused\n"
+    )
+    assert case.arrow is arrow.REFUSED
+
+
+@pytest.mark.parametrize(
+    ("text", "want"),
+    [
+        ("    arrow: yes\n", "or `refused` for a result"),
+        ("    arrow:\n      - n\n", "an Arrow field is a mapping"),
+        ("    arrow:\n      - format: l\n", "an Arrow field has a `name:`"),
+        ("    arrow:\n      - name: n\n", "an Arrow field has a `format:`"),
+        ('    arrow:\n      - name: n\n        format: ""\n', "not a type Arrow has"),
+        ("    arrow:\n      - name: n\n        format: l\n        kind: int\n", 'no key "kind"'),
+        (
+            "    arrow:\n      - name: n\n        format: +l\n",
+            "is a nested type and the fields under it are part of it",
+        ),
+        (
+            "    arrow:\n      - name: n\n        format: l\n        children:\n"
+            "          - name: item\n            format: u\n",
+            "holds no fields, so nothing goes under it",
+        ),
+    ],
+)
+def test_an_export_written_wrong_is_refused_where_it_is_written(text: str, want: str) -> None:
+    with pytest.raises(reader.CorpusError) as raised:
+        suite(f"  - name: a\n    doc: d\n    query: RETURN 1\n    raises: 22012\n{text}")
+    assert want in str(raised.value)
+
+
+def test_what_the_export_gave_that_the_case_did_not_want_is_said_the_way_rust_says_it() -> None:
+    """One wording per difference, checked here rather than only through
+    a run, because these are the lines the nine reports are diffed by."""
+    n = arrow.Field("n", "l")
+    assert arrow.schema([n], [n]) is None
+    assert arrow.schema([n, n], [n]) == "arrow gives 2 fields in the result where the case wants 1"
+    assert (
+        arrow.schema([arrow.Field("m", "l")], [n])
+        == 'arrow field 1 in the result is named "m" where the case wants "n"'
+    )
+    assert (
+        arrow.schema([arrow.Field("n", "u")], [n])
+        == 'arrow field "n" is "u" where the case wants "l"'
+    )
+    nested = arrow.Field("xs", "+l", (arrow.Field("item", "u"),))
+    assert (
+        arrow.schema([arrow.Field("xs", "+l", (arrow.Field("item", "l"),))], [nested])
+        == 'arrow field "xs.item" is "l" where the case wants "u"'
+    )
+    assert (
+        arrow.schema([arrow.Field("xs", "+l", ())], [nested])
+        == 'arrow gives 0 fields in "xs" where the case wants 1'
+    )
+
+
 # Running.
 
 
@@ -700,7 +918,7 @@ def _write(tmp_path: Path, name: str, body: str) -> Path:
     directory = tmp_path / "cases"
     directory.mkdir(exist_ok=True)
     (directory / f"{name}.yaml").write_text(
-        f"schema: 3\nsuite: {name}\ndoc: a suite written by a test\ncases:\n{body}"
+        f"schema: 4\nsuite: {name}\ndoc: a suite written by a test\ncases:\n{body}"
     )
     return directory
 
@@ -805,7 +1023,7 @@ def test_a_suite_load_reaches_every_case_and_no_case_reaches_another(tmp_path: P
     directory = tmp_path / "cases"
     directory.mkdir()
     (directory / "graph.yaml").write_text(
-        "schema: 3\nsuite: graph\ndoc: a loaded suite\nload:\n  nodes: person\n  edges: knows\n"
+        "schema: 4\nsuite: graph\ndoc: a loaded suite\nload:\n  nodes: person\n  edges: knows\n"
         "  count: 2\n  columns:\n    - name: name\n      type: STRING\n      values:\n"
         "        - ada\n        - bob\n  pairs:\n    - from: 0\n      to: 1\n"
         "cases:\n"
@@ -837,6 +1055,90 @@ def test_a_case_binds_its_parameters_through_this_client(tmp_path: Path) -> None
     assert report.count(runner.PASSED) == 1
 
 
+def test_a_second_connection_sees_what_the_first_one_committed(tmp_path: Path) -> None:
+    """The whole point of naming a connection: a write that came back
+    from one is a write the other reads. The two are duplicates of each
+    other and share the write side, so this is the answer a pool gives
+    and not the answer two opens of one file give."""
+    report = _run(
+        tmp_path,
+        "two",
+        "  - name: across\n    doc: a committed write is another connection's to read\n"
+        '    setup:\n      - on: writer\n        query: "INSERT (:thing {n: 1})"\n'
+        "    on: reader\n    query: MATCH (t:thing) RETURN count(t) AS n\n" + rows_of("1"),
+    )
+    assert report.summary() == "1 cases, 1 passed, 0 failed, 0 unsupported"
+
+
+def test_a_case_naming_no_connection_runs_everything_on_the_one_it_opened(
+    tmp_path: Path,
+) -> None:
+    report = _run(
+        tmp_path,
+        "one",
+        "  - name: alone\n    doc: a case that says nothing about connections\n"
+        '    setup:\n      - "INSERT (:thing {n: 1})"\n'
+        "    query: MATCH (t:thing) RETURN count(t) AS n\n" + rows_of("1"),
+    )
+    assert report.count(runner.PASSED) == 1
+
+
+def test_the_export_is_checked_against_the_same_result_the_rows_came_from(
+    tmp_path: Path,
+) -> None:
+    report = _run(
+        tmp_path,
+        "small",
+        "  - name: one\n    doc: an int64 column is an int64 on the way out\n"
+        "    query: RETURN 1 AS n\n" + rows_of("1") + "    arrow:\n      - name: n\n"
+        "        format: l\n",
+    )
+    assert report.summary() == "1 cases, 1 passed, 0 failed, 0 unsupported"
+
+
+def test_an_export_that_is_not_what_the_case_wants_is_a_failure_and_says_which_field(
+    tmp_path: Path,
+) -> None:
+    report = _run(
+        tmp_path,
+        "small",
+        "  - name: one\n    doc: a case that wants the wrong Arrow type\n"
+        "    query: RETURN 1 AS n\n" + rows_of("1") + "    arrow:\n      - name: n\n"
+        "        format: u\n",
+    )
+    assert report.failures()[0].detail == 'arrow field "n" is "l" where the case wants "u"'
+
+
+def test_a_result_arrow_will_not_take_is_a_refusal_and_not_a_crash(tmp_path: Path) -> None:
+    """A time with an offset is the one a statement can write today.
+    Arrow has a time and a timestamp and nothing in between, so the
+    export says no, and a case saying `refused` is a case that passes on
+    it saying no."""
+    body = (
+        "  - name: offset\n    doc: a time with an offset has no Arrow type\n"
+        "    query: RETURN ZONED TIME '12:34:56+07:00' AS n\n    columns:\n      - n\n"
+        "    rows:\n      - values:\n          - type: ZONEDTIME\n"
+        '            value: "12:34:56+07:00"\n'
+    )
+    assert _run(tmp_path, "zoned", body + "    arrow: refused\n").count(runner.PASSED) == 1
+    wanted = _run(tmp_path, "zoned", body + "    arrow:\n      - name: n\n        format: l\n")
+    assert wanted.failures()[0].detail.startswith("arrow refused the result: ")
+
+
+def test_an_export_giving_a_different_number_of_rows_is_reported(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The rows are counted off the stream rather than taken from the
+    rows already read, because an export that gave the right schema and
+    half the rows would pass every other check in here. The engine does
+    not disagree with itself about how many rows a result has, so the
+    only way to see the report is to make it disagree."""
+    field = arrow.Field("n", "l")
+    monkeypatch.setattr(arrow, "exported", lambda result: ([field], 2))
+    assert runner._exported([field], object(), 2) is None
+    assert runner._exported([field], object(), 3) == "arrow gives 2 rows where the case wants 3"
+
+
 def test_the_command_line_exits_zero_on_a_run_that_passes(tmp_path: Path) -> None:
     directory = _write(
         tmp_path,
@@ -853,7 +1155,7 @@ def test_the_command_line_exits_one_on_a_corpus_it_cannot_read(tmp_path: Path) -
     disagree about what the run came to."""
     directory = tmp_path / "cases"
     directory.mkdir()
-    (directory / "small.yaml").write_text("schema: 3\nsuite: small\ndoc: d\ncases:\n  - name: a\n")
+    (directory / "small.yaml").write_text("schema: 4\nsuite: small\ndoc: d\ncases:\n  - name: a\n")
     assert runner.main([str(directory), "--quiet"]) == 1
 
 
@@ -886,11 +1188,12 @@ def test_the_module_runs_as_a_command(tmp_path: Path) -> None:
 
 
 #: The cases this client cannot answer, and the only ones it may leave
-#: unanswered. Written out rather than counted, so that a sixth one
-#: arriving is a failure here and not a number nobody looks at. All five
+#: unanswered. Written out rather than counted, so that a seventh one
+#: arriving is a failure here and not a number nobody looks at. All six
 #: are a time to the nanosecond, which is a digit finer than Python's
 #: `datetime` holds.
 UNHELD = {
+    "arrow/a-local-time-is-nanoseconds-from-midnight",
     "param/localtime-to-the-nanosecond",
     "stored/a-localtime-column-keeps-every-digit",
     "stored/the-columns-of-one-row-belong-to-that-row",
@@ -899,24 +1202,36 @@ UNHELD = {
 }
 
 
+@pytest.fixture(scope="session")
+def corpus() -> Iterator[runner.Report]:
+    """The whole corpus, run once for everything below that reads it.
+
+    Every case gets a database of its own and there are over a thousand
+    of them, so a run is a couple of gigabytes that exist for as long as
+    it takes. Once per session rather than once per test, and under a
+    directory that goes with the run rather than one pytest keeps three
+    generations of: two tests reading one report is not a reason to fill
+    a disk twice over, and it is a disk this has already filled."""
+    with tempfile.TemporaryDirectory(prefix="zudb-corpus-") as work:
+        yield runner.run(cases.read_dir(Path(CASES)), Path(work))
+
+
 @needs_cases
-def test_every_case_the_engine_ships_passes_through_this_client(tmp_path: Path) -> None:
+def test_every_case_the_engine_ships_passes_through_this_client(corpus: runner.Report) -> None:
     """The corpus itself, which is the check the other two runners run
     and the reason this one exists."""
-    report = runner.run(cases.read_dir(Path(CASES)), tmp_path)
-    assert report.count(runner.FAILED) == 0, [str(r) for r in report.failures()][:10]
-    unheld = {f"{r.suite}/{r.case}" for r in report.ran if r.outcome == runner.UNSUPPORTED}
+    assert corpus.count(runner.FAILED) == 0, [str(r) for r in corpus.failures()][:10]
+    unheld = {f"{r.suite}/{r.case}" for r in corpus.ran if r.outcome == runner.UNSUPPORTED}
     assert unheld == UNHELD
-    assert report.count(runner.PASSED) == len(report.ran) - len(UNHELD)
+    assert corpus.count(runner.PASSED) == len(corpus.ran) - len(UNHELD)
 
 
 @needs_cases
 def test_the_cases_this_client_cannot_hold_are_a_precision_and_not_a_wrong_answer(
-    tmp_path: Path,
+    corpus: runner.Report,
 ) -> None:
     """Every one of them says which value it is and why, because a case
     reported as unsupported with no reason is a case nobody revisits."""
-    report = runner.run(cases.read_dir(Path(CASES)), tmp_path)
-    for ran in report.ran:
+    for ran in corpus.ran:
         if ran.outcome == runner.UNSUPPORTED:
             assert "finer" in ran.detail, str(ran)

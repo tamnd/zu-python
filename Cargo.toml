@@ -18,14 +18,14 @@ crate-type = ["cdylib"]
 # with (ADR 0002), so a revision is the honest way to say which one.
 # A local checkout is used instead with a `paths` override in
 # `.cargo/config.toml`, which is untracked on purpose.
-zudb = { package = "zu", git = "https://github.com/tamnd/zu", rev = "0698a4eccd31670f0a875b6d097d7753440a51b3" }
-zu-common = { git = "https://github.com/tamnd/zu", rev = "0698a4eccd31670f0a875b6d097d7753440a51b3" }
+zudb = { package = "zu", git = "https://github.com/tamnd/zu", rev = "6ee7d8019415ba16145e9324ccb16b4ffa1d6c9a" }
+zu-common = { git = "https://github.com/tamnd/zu", rev = "6ee7d8019415ba16145e9324ccb16b4ffa1d6c9a" }
 # The one translation from a result into Arrow, which lives in the
 # engine tree so that every client agrees about what a column becomes.
 # `ffi` is the only feature this client turns on: what Python wants is
 # the C Data Interface, which is how a result reaches pyarrow, pandas
 # and polars without a Python object per cell.
-zu-arrow = { git = "https://github.com/tamnd/zu", rev = "0698a4eccd31670f0a875b6d097d7753440a51b3", features = ["ffi"] }
+zu-arrow = { git = "https://github.com/tamnd/zu", rev = "6ee7d8019415ba16145e9324ccb16b4ffa1d6c9a", features = ["ffi"] }
 # `extension-module` is asked for by maturin, in pyproject.toml, and
 # not here. Only the build backend knows how an extension is linked on
 # the platform it is building for, and a crate that turns the feature

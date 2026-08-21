@@ -15,6 +15,13 @@ values travel: a case with ``params:`` writes a value in the encoding,
 hands it to this client's own binding call, and asserts what came back.
 A client that decodes a date correctly and encodes it a day early passes
 every case that has no parameters in it.
+
+A case may say which connection each of its statements runs on, which is
+how a case about a transaction is written: a transaction is only
+observable from outside it, so a case that has to say what a commit
+means needs a second connection to say it to. A case that says nothing
+runs everything on one connection called ``main``, which is every case
+but a handful.
 """
 
 from __future__ import annotations
@@ -22,19 +29,31 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from . import values
+from . import arrow, values
 from .reader import CorpusError, Node, parse, quote
 
-__all__ = ["SCHEMA", "Case", "Suite", "Column", "Load", "read_dir"]
+__all__ = ["SCHEMA", "MAIN", "Case", "Step", "Suite", "Column", "Load", "read_dir"]
 
 #: The schema version a file declares. It exists so that a corpus
 #: unpacked from an old release tells a new runner what it is instead of
 #: failing in the middle.
-SCHEMA = 3
+SCHEMA = 4
+
+#: The connection a statement runs on when the case does not name one.
+MAIN = "main"
 
 _SUITE_KEYS = ("schema", "suite", "doc", "load", "cases")
-_CASE_KEYS = ("name", "doc", "setup", "params", "query", "columns", "rows", "raises")
+_CASE_KEYS = ("name", "doc", "setup", "on", "params", "query", "columns", "rows", "raises", "arrow")
 _LOAD_KEYS = ("nodes", "edges", "count", "columns", "pairs")
+
+
+@dataclass
+class Step:
+    """A statement run before the one under test, and the connection it
+    runs on."""
+
+    on: str
+    query: str
 
 
 @dataclass
@@ -49,11 +68,19 @@ class Case:
     doc: str
     query: str
     line: int
-    setup: list[str] = field(default_factory=list)
+    setup: list[Step] = field(default_factory=list)
+    #: The connection the statement under test runs on, which is
+    #: :data:`MAIN` unless the case says otherwise.
+    on: str = MAIN
     params: list[tuple[str, object]] = field(default_factory=list)
     columns: list[str] | None = None
     rows: list[list[object]] | None = None
     raises: str | None = None
+    #: What the same result looks like on the way out through Arrow, for
+    #: a case that says. Most do not: the export gives one answer per
+    #: column type and a handful of cases pin every one of them, so the
+    #: rest would be repeating a type the corpus already covers.
+    arrow: list[arrow.Field] | arrow.Refused | None = None
 
 
 @dataclass
@@ -182,19 +209,21 @@ def _case(node: Node) -> Case:
     doc = _field(node, "doc")
     query = _field(node, "query")
 
-    setup: list[str] = []
+    setup: list[Step] = []
     setup_node = node.get("setup")
     if setup_node is not None:
         items = setup_node.seq()
         if items is None:
             raise CorpusError(f"line {line}: `setup:` is a sequence of statements")
-        for item in items:
-            text = item.str_()
-            if text is None:
-                raise CorpusError(f"line {item.line}: a setup statement is one line")
-            setup.append(text)
+        setup = [_step(item) for item in items]
+
+    on_node = node.get("on")
+    on = _connection(on_node) if on_node is not None else MAIN
 
     params = _params(node)
+
+    arrow_node = node.get("arrow")
+    export = arrow.parse(arrow_node) if arrow_node is not None else None
 
     raises_node = node.get("raises")
     columns_node = node.get("columns")
@@ -211,7 +240,7 @@ def _case(node: Node) -> Case:
                 f"line {raises_node.line}: {quote(code)} is not the shape of a GQLSTATUS, which is "
                 "five characters of digits and capitals"
             )
-        return Case(name, doc, query, line, setup, params, raises=code)
+        return Case(name, doc, query, line, setup, on, params, raises=code, arrow=export)
     if columns_node is None:
         raise CorpusError(
             f"line {line}: a case says what it produces, with `columns:` and `rows:` or with "
@@ -234,7 +263,46 @@ def _case(node: Node) -> Case:
     for row in rows:
         if len(row) != len(columns):
             raise CorpusError(f"line {line}: a row of {len(row)} against {len(columns)} columns")
-    return Case(name, doc, query, line, setup, params, columns=columns, rows=rows)
+    return Case(name, doc, query, line, setup, on, params, columns=columns, rows=rows, arrow=export)
+
+
+def _step(node: Node) -> Step:
+    """One setup statement, which is a line of its own or a line and the
+    connection it runs on."""
+    text = node.str_()
+    if text is not None:
+        return Step(MAIN, text)
+    if node.map() is None:
+        raise CorpusError(
+            f"line {node.line}: a setup statement is one line, or `on:` and `query:`, and this is "
+            f"{node.what()}"
+        )
+    unknown = node.unknown(("on", "query"))
+    if unknown:
+        raise CorpusError(f"line {node.line}: a setup statement has no key {quote(unknown[0])}")
+    on_node = node.get("on")
+    if on_node is None:
+        raise CorpusError(
+            f"line {node.line}: a setup statement written as a mapping names the connection it "
+            "runs on"
+        )
+    return Step(_connection(on_node), _field(node, "query"))
+
+
+def _connection(node: Node) -> str:
+    """The name of a connection, spelled the way a case name is, because
+    a report cites it and a name a reader has to guess at is a report
+    that says less than it looks like it does."""
+    name = node.str_()
+    if name is None:
+        raise CorpusError(f"line {node.line}: `on:` is the name of a connection")
+    spelled = name.isascii() and all(c.islower() or c.isdigit() or c == "-" for c in name)
+    if not name or not spelled:
+        raise CorpusError(
+            f"line {node.line}: {quote(name)} is a connection name, which is lower case words "
+            "joined by dashes"
+        )
+    return name
 
 
 def _params(node: Node) -> list[tuple[str, object]]:
