@@ -79,7 +79,7 @@ jobs:
           container: ${{ matrix.image }}
           # Named rather than left to the toolchain file, which the
           # build container does not read.
-          rust-toolchain: 1.97.1
+          rust-toolchain: 1.98.0
           args: --release --out dist -i /opt/python/cp311-cp311/bin/python
           # A shared object cannot have a static C runtime linked into
           # it, which is the musl default and a no-op everywhere else.
