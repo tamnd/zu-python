@@ -25,12 +25,14 @@ import sys
 import tempfile
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Any
 
 import zudb
 
-from .cases import Case, Load, Suite, read_dir
-from .reader import CorpusError
-from .values import same, show, too_fine, truncated
+from . import arrow
+from .cases import MAIN, Case, Load, Suite, read_dir
+from .reader import CorpusError, quote
+from .values import cell, same, show, too_fine, truncated
 
 __all__ = ["Ran", "Report", "run", "main"]
 
@@ -115,10 +117,15 @@ def _one(suite: Suite, case: Case, directory: Path) -> Ran:
     except zudb.Error as e:
         return ran(FAILED, f"opening {path}: {e}")
 
+    open_conns: list[tuple[str, zudb.Connection]] = [(MAIN, conn)]
     try:
-        for i, statement in enumerate(case.setup):
+        for i, step in enumerate(case.setup):
             try:
-                conn.execute(statement)
+                on = _connection(open_conns, step.on)
+            except zudb.Error as e:
+                return ran(FAILED, f"connecting as {quote(step.on)}: {_said(e)}")
+            try:
+                on.execute(step.query)
             except zudb.Error as e:
                 # A setup that fails is not a result about the statement
                 # under test, so it is never a pass and never a quiet
@@ -127,9 +134,14 @@ def _one(suite: Suite, case: Case, directory: Path) -> Ran:
                     return ran(UNSUPPORTED, f"setup {i + 1}: {_said(e)}")
                 return ran(FAILED, f"setup {i + 1} failed: {_said(e)}")
 
+        try:
+            on = _connection(open_conns, case.on)
+        except zudb.Error as e:
+            return ran(FAILED, f"connecting as {quote(case.on)}: {_said(e)}")
+
         params = dict(case.params) if case.params else None
         try:
-            result = conn.execute(case.query, params)
+            result = on.execute(case.query, params)
             rows = result.fetchall()
         except zudb.Error as e:
             if case.raises is not None:
@@ -151,9 +163,66 @@ def _one(suite: Suite, case: Case, directory: Path) -> Ran:
         if case.raises is not None:
             return ran(FAILED, f"returned rows where the case wants {case.raises}")
         detail = _compare(case.columns or [], case.rows or [], result.columns, rows)
+        if detail is not None:
+            return ran(FAILED, detail)
+        # The export is checked on the result the rows were read from
+        # rather than on a second run of the statement, because it is the
+        # same result a client exports: one statement, two ways of
+        # reading what it gave back.
+        detail = _exported(case.arrow, result, len(rows))
         return ran(PASSED) if detail is None else ran(FAILED, detail)
     finally:
-        conn.close()
+        # In reverse, so that the connection the case was opened with is
+        # the last one to go, which is the order the ones after it were
+        # made from it in.
+        for _, open_conn in reversed(open_conns):
+            open_conn.close()
+
+
+def _connection(open_conns: list[tuple[str, Any]], name: str) -> Any:
+    """The connection a case named, made if this is the first mention of
+    it.
+
+    A new one is a duplicate of the case's own rather than a second open
+    of the file, which is what a pool does: the two share the write side,
+    so each sees what the other has committed. Opening the path twice
+    would be two databases that happen to be the same file, which is a
+    different thing and not what a case about a transaction means."""
+    for had, open_conn in open_conns:
+        if had == name:
+            return open_conn
+    made = open_conns[0][1].duplicate()
+    open_conns.append((name, made))
+    return made
+
+
+def _exported(
+    want: list[arrow.Field] | arrow.Refused | None,
+    result: Any,
+    rows: int,
+) -> str | None:
+    """What the export gave that the case did not want, or ``None`` when
+    the case says nothing about it and when the two agree.
+
+    A result Arrow has no type for is a refusal from the export rather
+    than a condition from the statement, so a case saying ``refused`` is
+    the case where the stream failing to open is the right answer."""
+    if want is None:
+        return None
+    try:
+        got, given = arrow.exported(result)
+    except (arrow.ArrowError, zudb.Error) as e:
+        if isinstance(want, arrow.Refused):
+            return None
+        return f"arrow refused the result: {e}"
+    if isinstance(want, arrow.Refused):
+        return "arrow exported the result where the case wants a refusal"
+    detail = arrow.schema(got, want)
+    if detail is not None:
+        return detail
+    if given != rows:
+        return f"arrow gives {given} rows where the case wants {rows}"
+    return None
 
 
 def _apply(load: Load, path: Path) -> None:
@@ -236,7 +305,11 @@ def _compare(
     if want_columns != got_columns:
         return f"columns {_names(got_columns)} where the case wants {_names(want_columns)}"
     for i, (want, got) in enumerate(zip(want_rows, got_rows, strict=False)):
-        for j, (a, b) in enumerate(zip(want, got, strict=False)):
+        for j, (a, raw) in enumerate(zip(want, got, strict=False)):
+            # Into the corpus's own shape first, because the engine's
+            # edge carries a field the corpus does not write and a
+            # comparison against it would fail on a number no case chose.
+            b = cell(raw)
             if not same(a, b):
                 name = want_columns[j] if j < len(want_columns) else "?"
                 return f"row {i + 1} column {name} is {show(b)} where the case wants {show(a)}"

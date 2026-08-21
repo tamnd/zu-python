@@ -13,6 +13,13 @@ YAML readers hand a number to a double. A float is a string, for that
 reason and for ``NaN``, ``inf`` and ``-0.0``. A temporal value is a
 string, because YAML has no type that keeps an offset.
 
+``NODE``, ``EDGE`` and ``PATH`` are the values a graph has and a table
+does not, and they are written as names rather than as the numbers the
+engine holds. A node is ``"person#1"``, the table it is a row of and
+which row of it. An edge is ``"knows#0->1"``, its table and the two rows
+it runs between. A path is a sequence, like a list, holding a node and
+then an edge and a node for each hop.
+
 Refusing the wrong form is half the point, and refusing it here is what
 makes this a second reader of the corpus rather than a consumer of it.
 
@@ -36,7 +43,19 @@ from zudb import Duration, Node, Path, Rel
 from .reader import CorpusError, quote
 from .reader import Node as YamlNode
 
-__all__ = ["decode", "typed", "payload", "same", "show", "form", "TooFine", "too_fine"]
+__all__ = [
+    "decode",
+    "typed",
+    "payload",
+    "cell",
+    "same",
+    "show",
+    "form",
+    "Edge",
+    "Walk",
+    "TooFine",
+    "too_fine",
+]
 
 #: Whether a type's payload is written as a quoted string. ``False`` is
 #: a type a YAML scalar carries without loss, ``True`` is one it does
@@ -62,12 +81,20 @@ _TYPES: dict[str, bool] = {
     "ZONEDDATETIME": True,
     "DURATION": True,
     "LIST": False,
+    # A node and an edge are written in quotes because what a case
+    # spells is a name and two numbers with punctuation between them,
+    # which is text in every reader and a number in none.
+    "NODE": True,
+    "EDGE": True,
+    # A path is a sequence, like a list, because that is what it is: the
+    # nodes and edges of a walk, in the order they were walked.
+    "PATH": False,
 }
 
 #: The types the encoding reserves a name for and the engine has no
 #: runtime value for yet, kept apart from an outright typo so that the
 #: error says which of the two it is.
-_RESERVED = ("DECIMAL", "BYTES", "NODE", "EDGE", "PATH")
+_RESERVED = ("DECIMAL", "BYTES")
 
 #: The range each integer width holds, so that a case writing a value
 #: its own type cannot carry is refused rather than stored wider than it
@@ -84,6 +111,36 @@ _RANGES: dict[str, tuple[int, int]] = {
     "UINT32": (0, 2**32 - 1),
     "UINT64": (0, 2**63 - 1),
 }
+
+
+@dataclass(frozen=True)
+class Edge:
+    """An edge as a case names it: the rel table it is in and the two
+    rows it runs between.
+
+    Not ``zudb.Rel``, which carries a fourth field the corpus does not
+    write. ``ord`` is where the edge's properties sit, which is its
+    place in the order the table was loaded in, and that is a number the
+    loader chose rather than one the case did. A pair may run more than
+    once, and a case that has to tell two parallel edges apart asserts a
+    property of them instead."""
+
+    table: str
+    src: int
+    dst: int
+
+
+@dataclass(frozen=True)
+class Walk:
+    """A path as a case writes it: nodes and edges alternating, a node
+    at each end.
+
+    Not ``zudb.Path`` for the reason ``Edge`` is not ``zudb.Rel``, and
+    for one more: what a case compares is the walk, and two walks that
+    cross the same edges are the same walk whichever copy of a parallel
+    edge the engine happened to hand back."""
+
+    elements: tuple[object, ...]
 
 
 @dataclass(frozen=True)
@@ -211,15 +268,16 @@ def payload(ty: str, value: YamlNode) -> object:
     if quoted_form is None:
         raise CorpusError(f"line {value.line}: {_unknown(ty)}")
 
-    if ty == "LIST":
+    if ty in ("LIST", "PATH"):
         # The empty list is a value worth a case and needs a spelling,
         # which is a `value:` with nothing under it.
         items = value.seq_or_empty()
         if items is None:
             raise CorpusError(
-                f"line {value.line}: a LIST holds a sequence of values, and this is {value.what()}"
+                f"line {value.line}: a {ty} holds a sequence of values, and this is {value.what()}"
             )
-        return [decode(item) for item in items]
+        decoded = [decode(item) for item in items]
+        return decoded if ty == "LIST" else _walk(decoded, value.line)
 
     scalar = value.scalar()
     if scalar is None:
@@ -230,6 +288,15 @@ def payload(ty: str, value: YamlNode) -> object:
     # is looked at, because a value that parses is exactly the case where
     # a silent misread would survive review.
     if quoted_form and not quoted:
+        # A node and an edge are quoted for a different reason from the
+        # numbers, so they are told a different reason. Both reasons are
+        # the same rule: a payload is quoted where a bare one would read
+        # as something else in some reader of this file.
+        if ty in ("NODE", "EDGE"):
+            raise CorpusError(
+                f"line {line}: {ty} is written in quotes, because {text} is a name and two "
+                "numbers and no reader has a scalar for that"
+            )
         raise CorpusError(
             f"line {line}: {ty} is written in quotes, because a bare {text} is a number and some "
             "reader of this file will round it"
@@ -239,10 +306,88 @@ def payload(ty: str, value: YamlNode) -> object:
             f"line {line}: {ty} is written without quotes, so that a reader cannot take it for a "
             "string"
         )
-    out = _scalar(ty, text)
+    if ty == "NODE":
+        out = _node_at(text)
+    elif ty == "EDGE":
+        out = _edge_at(text)
+    else:
+        out = _scalar(ty, text)
     if out is _NOT_ONE:
         raise CorpusError(f"line {line}: {quote(text)} is not a {ty}")
     return out
+
+
+def _walk(items: list[object], line: int) -> Walk:
+    """The nodes and edges of a walk, or what is wrong with the sequence
+    somebody wrote.
+
+    A path alternates and ends at both ends with a node, so a sequence
+    that does not is a case that could never pass. Refusing it here
+    rather than at the comparison is the difference between a message
+    naming the line and a report saying the row differs."""
+    if len(items) % 2 == 0:
+        raise CorpusError(
+            f"line {line}: a PATH is a node, then an edge and a node for each hop, so it holds an "
+            f"odd number of values and this holds {len(items)}"
+        )
+    for i, item in enumerate(items):
+        want_node = i % 2 == 0
+        if isinstance(item, Node):
+            ok, was = want_node, "a NODE"
+        elif isinstance(item, Edge):
+            ok, was = not want_node, "an EDGE"
+        else:
+            ok, was = False, "neither a NODE nor an EDGE"
+        if not ok:
+            wanted = "a NODE" if want_node else "an EDGE"
+            raise CorpusError(
+                f"line {line}: a PATH alternates, so value {i + 1} is {was} where it should be "
+                f"{wanted}"
+            )
+    return Walk(tuple(items))
+
+
+def _node_at(text: str) -> object:
+    """A node, written as its table and the offset of its row:
+    ``person#1``.
+
+    The table's name rather than its id, because the id is a number the
+    file decided and every client builds its own file. Split from the
+    right, so that a table whose name holds a ``#`` is still readable."""
+    table, hash_, offset = text.rpartition("#")
+    if not hash_ or not table or not offset.isdigit():
+        return _NOT_ONE
+    return Node(table, int(offset))
+
+
+def _edge_at(text: str) -> object:
+    """An edge, written as its table and the rows it runs between:
+    ``knows#0->1``."""
+    table, hash_, ends = text.rpartition("#")
+    if not hash_ or not table:
+        return _NOT_ONE
+    src, arrow, dst = ends.partition("->")
+    if not arrow or not src.isdigit() or not dst.isdigit():
+        return _NOT_ONE
+    return Edge(table, int(src), int(dst))
+
+
+def cell(value: object) -> object:
+    """The corpus's own shape for a value that came back from a
+    statement.
+
+    Everything a table holds is spelled the same on both sides and comes
+    through untouched. A graph value is not: the engine's edge carries an
+    ``ord`` the corpus does not write, so an edge and a path are put into
+    the shapes above before anything is compared, which is what the Rust
+    runner's ``from_engine`` does for the same reason."""
+    if isinstance(value, Rel):
+        return Edge(value.table, value.src, value.dst)
+    if isinstance(value, Path):
+        return Walk(tuple(cell(item) for item in value.elements))
+    if isinstance(value, list):
+        return [cell(item) for item in value]
+    return value
 
 
 #: What `_scalar` gives back for text that does not spell a value of the
@@ -468,6 +613,8 @@ def same(want: object, got: object) -> bool:
         return math.copysign(1.0, want) == math.copysign(1.0, got) and want == got
     if isinstance(want, list) and isinstance(got, list):
         return len(want) == len(got) and all(same(a, b) for a, b in zip(want, got, strict=True))
+    if isinstance(want, Walk) and isinstance(got, Walk):
+        return same(list(want.elements), list(got.elements))
     if isinstance(want, dict) and isinstance(got, dict):
         return list(want) == list(got) and all(same(want[k], got[k]) for k in want)
     return type(want) is type(got) and want == got
@@ -505,8 +652,16 @@ def show(value: object) -> str:
     if isinstance(value, dict):
         fields = ", ".join(f"{name}: {show(v)}" for name, v in value.items())
         return f"RECORD {{{fields}}}"
-    if isinstance(value, (Node, Rel, Path)):
-        return repr(value)
+    if isinstance(value, Node):
+        return f'NODE "{value.table}#{value.offset}"'
+    if isinstance(value, Edge):
+        return f'EDGE "{value.table}#{value.src}->{value.dst}"'
+    if isinstance(value, Walk):
+        return f"PATH [{', '.join(show(item) for item in value.elements)}]"
+    # A `zudb.Rel` or a `zudb.Path` reaching here is a value the runner
+    # did not put through `cell`, which is a defect in this runner rather
+    # than a wrong answer, so it prints as itself and says so by not
+    # looking like anything a case could be written from.
     return repr(value)
 
 
