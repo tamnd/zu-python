@@ -3,5 +3,5 @@
 # a different build of the same code. Held to the version in
 # tamnd/zu's toolchains.toml.
 [toolchain]
-channel = "1.97.1"
+channel = "1.98.0"
 components = ["rustfmt", "clippy"]
