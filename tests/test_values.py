@@ -29,6 +29,8 @@ def test_two_reads_of_one_node_are_equal_and_hash_alike(social: zudb.Connection)
         ("RETURN 1 AS v", 1),
         ("RETURN 1.5 AS v", 1.5),
         ("RETURN 'ada' AS v", "ada"),
+        ("RETURN X'00AB00' AS v", b"\x00\xab\x00"),
+        ("RETURN X'' AS v", b""),
         ("RETURN true AS v", True),
         ("RETURN false AS v", False),
         ("RETURN null AS v", None),
@@ -43,6 +45,35 @@ def test_a_literal_reads_back_as_the_python_object_it_is(
     got = empty.execute(statement).fetchone()[0]
     assert got == answer
     assert type(got) is type(answer)
+
+
+def test_a_byte_string_is_bytes_and_not_the_string_that_spells_it(
+    empty: zudb.Connection,
+) -> None:
+    """A byte string is octets and a string is characters, and the whole
+    reason the type exists is that the two are not the same value."""
+    (same,) = empty.execute("RETURN X'0041' = 'A' AS v").fetchone()
+    assert same is not True
+    got = empty.execute("RETURN X'0041' AS v").fetchone()[0]
+    assert got == b"\x00A"
+    assert got != "\x00A"
+
+
+def test_a_byte_string_goes_in_as_a_parameter_and_comes_back_the_same(
+    empty: zudb.Connection,
+) -> None:
+    got = empty.execute("RETURN $b AS v", {"b": b"\xde\xad\xbe\xef"}).fetchone()[0]
+    assert got == b"\xde\xad\xbe\xef"
+    assert type(got) is bytes
+
+
+def test_a_mutable_buffer_is_not_a_byte_string_parameter(empty: zudb.Connection) -> None:
+    """A parameter is read after the call that takes it returns, so a
+    buffer the caller can still write through is a promise this client
+    does not take. The refusal names the types it does take, which is
+    the shortest way to say `bytes(...)`."""
+    with pytest.raises(TypeError, match="byte strings"):
+        empty.execute("RETURN $b AS v", {"b": bytearray(b"\x00")})
 
 
 def test_a_duration_counts_months_or_nanoseconds_and_never_both() -> None:

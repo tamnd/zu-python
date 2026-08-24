@@ -389,6 +389,60 @@ def test_a_graph_value_prints_the_way_a_case_writes_one() -> None:
     )
 
 
+def test_a_byte_string_is_read_from_its_hexits_in_either_case() -> None:
+    assert value('type: BYTES\nvalue: "00AB00"\n') == b"\x00\xab\x00"
+    assert value('type: BYTES\nvalue: "00ab00"\n') == b"\x00\xab\x00"
+    # Space anywhere and dropped, which is what lets a long literal be
+    # written in groups. All of the whitespace the reference reader
+    # drops, which is Rust's `is_ascii_whitespace`.
+    assert value('type: BYTES\nvalue: "00 AB 00"\n') == b"\x00\xab\x00"
+    assert value('type: BYTES\nvalue: "00\\tAB\\n00\\r\\f"\n') == b"\x00\xab\x00"
+    # The empty byte string is a value and a case is written for it, so
+    # it needs a spelling, and the spelling is nothing between quotes.
+    assert value('type: BYTES\nvalue: ""\n') == b""
+
+
+@pytest.mark.parametrize(
+    ("text", "want"),
+    [
+        # Half a byte is not a byte string, and the two hexits a byte
+        # takes are the whole reason a case writes an even number.
+        ('type: BYTES\nvalue: "abc"\n', "is not a BYTES"),
+        ('type: BYTES\nvalue: "zz"\n', "is not a BYTES"),
+        # A digit of another script reads as a digit to `int` and to
+        # nothing else in the family, so it is refused here too.
+        ('type: BYTES\nvalue: "٣٣"\n', "is not a BYTES"),
+        # A backspace is a control character and not the whitespace the
+        # reference reader drops, so it is a character that is not a
+        # hexit rather than a gap between two of them.
+        ('type: BYTES\nvalue: "00\\b00"\n', "is not a BYTES"),
+        # And the quoting rule, which is the one the encoding exists for:
+        # a bare 0041 is a number with a leading zero in one reader and
+        # the string it looks like in another.
+        ("type: BYTES\nvalue: 0041\n", "BYTES is written in quotes"),
+    ],
+)
+def test_a_byte_string_written_wrong_is_refused(text: str, want: str) -> None:
+    with pytest.raises(reader.CorpusError) as raised:
+        value(text)
+    assert want in str(raised.value)
+
+
+def test_a_byte_string_prints_the_way_a_case_writes_one() -> None:
+    assert values.show(b"\x00\xab\x00") == 'BYTES "00AB00"'
+    assert values.show(b"") == 'BYTES ""'
+
+
+def test_a_byte_string_is_not_the_string_that_spells_the_same_octets() -> None:
+    # The case at `string.yaml` asserting that `X'0041' = 'A'` is not
+    # true is only worth running if this reader keeps the two apart, and
+    # a reader that decoded octets into a `str` somewhere would pass it
+    # for the wrong reason.
+    assert not values.same(b"A", "A")
+    assert not values.same("A", b"A")
+    assert values.same(b"A", b"A")
+
+
 def test_a_type_the_engine_cannot_hold_yet_says_so_rather_than_looking_like_a_typo() -> None:
     with pytest.raises(reader.CorpusError) as raised:
         value('type: DECIMAL\nvalue: "1.00"\n')

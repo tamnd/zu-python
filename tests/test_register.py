@@ -93,11 +93,11 @@ def test_every_kind_of_column_a_row_can_hold_arrives_as_itself(empty: zudb.Conne
     frame = pa.table(
         {
             "yes": pa.array([True, False]),
-            "small": pa.array([1, 2], pa.int8()),
+            "tiny": pa.array([1, 2], pa.int8()),
             "wide": pa.array([3, 4], pa.uint32()),
             "narrow": pa.array([1.5, 2.5], pa.float32()),
             "word": pa.array(["a", "b"]),
-            "day": pa.array([datetime.date(2024, 1, 1), datetime.date(2024, 2, 1)]),
+            "birthday": pa.array([datetime.date(2024, 1, 1), datetime.date(2024, 2, 1)]),
             "clock": pa.array([datetime.time(1, 2, 3), datetime.time(4, 5, 6)], pa.time64("us")),
             "moment": pa.array(
                 [datetime.datetime(2024, 1, 1, 1, 2, 3), datetime.datetime(2024, 2, 1)]
@@ -107,8 +107,8 @@ def test_every_kind_of_column_a_row_can_hold_arrives_as_itself(empty: zudb.Conne
     )
     assert empty.register("kinds", frame) == 2
     row = empty.execute(
-        "MATCH (k:kinds) RETURN k.yes AS yes, k.small AS small, k.wide AS wide, "
-        "k.narrow AS narrow, k.word AS word, k.day AS day, k.clock AS clock, "
+        "MATCH (k:kinds) RETURN k.yes AS yes, k.tiny AS tiny, k.wide AS wide, "
+        "k.narrow AS narrow, k.word AS word, k.birthday AS birthday, k.clock AS clock, "
         "k.moment AS moment, k.span AS span"
     ).fetchone()
     assert row == (

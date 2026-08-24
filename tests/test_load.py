@@ -108,7 +108,7 @@ def test_the_same_edge_twice_is_one_edge(tmp_path: Path) -> None:
 
 def test_a_column_of_every_kind_reads_back_as_what_it_was(tmp_path: Path) -> None:
     columns = {
-        "count": [1, -2],
+        "tally": [1, -2],
         "ratio": [1.5, -0.25],
         "flag": [True, False],
         "name": ["ada", "grace"],

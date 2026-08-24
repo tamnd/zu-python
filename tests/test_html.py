@@ -68,7 +68,7 @@ def test_a_boolean_is_not_a_number_to_line_up(empty: zudb.Connection) -> None:
 
 def test_a_null_says_so_rather_than_being_blank(empty: zudb.Connection) -> None:
     empty.execute("INSERT (p:person {uid: 1, name: 'ada'})")
-    html = empty.execute("MATCH (p:person) RETURN null AS nothing")._repr_html_()
+    html = empty.execute("MATCH (p:person) RETURN null AS missing")._repr_html_()
     assert cells(html) == ["null"]
     assert 'class="zu-null"' in html
 
