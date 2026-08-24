@@ -140,7 +140,7 @@ jobs:
           container: ${{ matrix.image || 'auto' }}
           # Named rather than left to the toolchain file, which the
           # build container does not read.
-          rust-toolchain: 1.97.1
+          rust-toolchain: 1.98.0
           # The interpreter, named, on the rows that build in a
           # container. Left to the path everywhere else, where
           # setup-python above put the row's interpreter first. An
