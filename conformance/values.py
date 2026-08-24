@@ -74,6 +74,11 @@ _TYPES: dict[str, bool] = {
     "FLOAT32": True,
     "FLOAT64": True,
     "STRING": False,
+    # A byte string is written in quotes because its hexits are digits
+    # as often as not: a bare 0041 is a number with a leading zero in
+    # one reader and the string it looks like in another, and neither of
+    # them is the two octets the case meant.
+    "BYTES": True,
     "DATE": True,
     "LOCALTIME": True,
     "ZONEDTIME": True,
@@ -93,8 +98,10 @@ _TYPES: dict[str, bool] = {
 
 #: The types the encoding reserves a name for and the engine has no
 #: runtime value for yet, kept apart from an outright typo so that the
-#: error says which of the two it is.
-_RESERVED = ("DECIMAL", "BYTES")
+#: error says which of the two it is. BYTES was here and is not any
+#: more: the engine gained the value in tamnd/zu#543 and this reader
+#: gained it with the pin that brought it in.
+_RESERVED = ("DECIMAL",)
 
 #: The range each integer width holds, so that a case writing a value
 #: its own type cannot carry is refused rather than stored wider than it
@@ -400,6 +407,8 @@ def _scalar(ty: str, text: str) -> object:
         return {"true": True, "false": False}.get(text, _NOT_ONE)
     if ty == "STRING":
         return text
+    if ty == "BYTES":
+        return _hexits(text)
     if ty in _RANGES:
         try:
             n = int(text)
@@ -438,6 +447,46 @@ def _scalar(ty: str, text: str) -> object:
     if ty == "DURATION":
         return _parse(text, _duration)
     return _NOT_ONE
+
+
+#: What each hexit is worth, both cases of the six letters, because ISO
+#: writes the literal in upper case and a case is free to write either.
+#: A table rather than ``int(c, 16)``, which also takes the digits of
+#: every other script and would read an Arabic-Indic three as a three.
+_HEXITS = {c: n for n, c in enumerate("0123456789abcdef")} | {
+    c: n + 10 for n, c in enumerate("ABCDEF")
+}
+
+#: What the reference reader drops between hexits, which is Rust's
+#: `is_ascii_whitespace`: a vertical tab is not in it.
+_SPACE = " \t\n\r\f"
+
+
+def _hexits(text: str) -> object:
+    """The octets a run of hexits names, or ``_NOT_ONE`` for text that is
+    not a run of them or that names half a byte.
+
+    Space is allowed anywhere and dropped, which is what the standard's
+    production allows and what lets a long literal be written in groups.
+
+    Written out rather than handed to ``bytes.fromhex``, which is the
+    same function on two counts and not on a third: it drops a vertical
+    tab as well, and which whitespace it drops has changed between
+    Python versions this client supports. A second reader of the corpus
+    that accepts a shade more than the first is a reader that lets a
+    malformed case through on one client and not on another, which is
+    the failure this whole module exists to make impossible."""
+    nibbles: list[int] = []
+    for c in text:
+        if c in _SPACE:
+            continue
+        nibble = _HEXITS.get(c)
+        if nibble is None:
+            return _NOT_ONE
+        nibbles.append(nibble)
+    if len(nibbles) % 2:
+        return _NOT_ONE
+    return bytes((high << 4) | low for high, low in zip(nibbles[::2], nibbles[1::2], strict=True))
 
 
 def _parse(text: str, fn) -> object:
@@ -634,6 +683,11 @@ def show(value: object) -> str:
         return f'FLOAT64 "{_show_float(value)}"'
     if isinstance(value, str):
         return f"STRING {quote(value)}"
+    # Upper case because ISO writes the literal that way, and a report
+    # that is diffed against the reference one is comparing text: one
+    # case is one answer.
+    if isinstance(value, bytes):
+        return f'BYTES "{value.hex().upper()}"'
     if isinstance(value, Duration):
         return f'DURATION "{_show_duration(value)}"'
     if isinstance(value, TooFine):

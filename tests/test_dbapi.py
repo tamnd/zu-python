@@ -125,7 +125,7 @@ def test_description_names_the_columns_and_their_types(conn: dbapi.Connection) -
 def test_a_column_that_is_null_the_whole_way_down_has_no_type(conn: dbapi.Connection) -> None:
     """There is nothing to read a type off, and a guess would be a lie."""
     cur = conn.cursor()
-    cur.execute("MATCH (p:person) RETURN p.name AS name, null AS nothing")
+    cur.execute("MATCH (p:person) RETURN p.name AS name, null AS missing")
     assert [column[1] for column in cur.description] == [str, None]
 
 

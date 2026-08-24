@@ -20,13 +20,16 @@ __all__ = ["Value"]
 #: because a list holds values and one of them may be a list. A
 #: ``timedelta`` goes in and never comes out: zu stores it as a day-time
 #: duration and hands one back, since a ``timedelta`` cannot hold every
-#: duration zu can.
+#: duration zu can. ``bytes`` and not ``bytearray``, because a parameter
+#: is read after the call that takes it returns and a mutable buffer is a
+#: promise the caller can break.
 Value: TypeAlias = (
     None
     | bool
     | int
     | float
     | str
+    | bytes
     | datetime.date
     | datetime.time
     | datetime.datetime

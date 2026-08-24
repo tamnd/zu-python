@@ -31,7 +31,7 @@
 
 use pyo3::exceptions::{PyTypeError, PyValueError};
 use pyo3::prelude::*;
-use pyo3::types::PyDict;
+use pyo3::types::{PyBytes, PyDict};
 use zudb::query::QueryResult;
 use zudb::query::column::{Column, ColumnData, ColumnType, Offsets, Validity};
 
@@ -98,6 +98,25 @@ fn column<'py>(
                 out.push(match missing(&valid, at) {
                     true => py.None(),
                     false => text(py, name, at, &bytes[from..upto])?,
+                });
+            }
+            return objects(py, out);
+        }
+        // The same two buffers a string column keeps, over bytes that
+        // are not text, so the walk is the string walk without the
+        // UTF-8 check. An object array for the same reason: numpy has
+        // no dtype for a run of octets whose length varies by row, and
+        // `S` pads every cell to the longest one and drops trailing
+        // nulls, which is a different value from the one stored.
+        ColumnData::Bytes(octets) => {
+            let mut out = Vec::with_capacity(len);
+            let bytes = &octets.bytes;
+            let mut spans = spans(&octets.offsets);
+            for at in 0..len {
+                let (from, upto) = spans.next().unwrap_or((0, 0));
+                out.push(match missing(&valid, at) {
+                    true => py.None(),
+                    false => PyBytes::new(py, &bytes[from..upto]).into_any().unbind(),
                 });
             }
             return objects(py, out);

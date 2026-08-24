@@ -10,7 +10,9 @@
 use std::collections::HashMap;
 
 use pyo3::prelude::*;
-use pyo3::types::{PyBool, PyDate, PyDateTime, PyDelta, PyDict, PyList, PyTime, PyTuple, PyTzInfo};
+use pyo3::types::{
+    PyBool, PyBytes, PyDate, PyDateTime, PyDelta, PyDict, PyList, PyTime, PyTuple, PyTzInfo,
+};
 use zu_common::temporal::{NANOS_PER_DAY, NANOS_PER_MINUTE, civil_from_days, days_from_civil};
 use zu_common::{DurationKind, Temporal};
 use zudb::query::Value;
@@ -312,6 +314,13 @@ pub fn to_py<'py>(py: Python<'py>, value: &Value, names: &Names) -> PyResult<Bou
         Value::Int(n) => n.into_pyobject(py)?.into_any(),
         Value::Float(f) => f.into_pyobject(py)?.into_any(),
         Value::Str(s) => s.into_pyobject(py)?.into_any(),
+        // `bytes` and not `bytearray`, because a value that came out of
+        // a result is a reading of what the file holds and nothing in
+        // Python should be able to write through it. It is the same
+        // type this client takes for a byte string parameter and the
+        // same one the loader takes for a byte string column, so a
+        // round trip through any of the three is one type.
+        Value::Bytes(b) => PyBytes::new(py, b).into_any(),
         Value::Node { table, offset } => Node {
             table: names.node(*table),
             offset: *offset,
@@ -510,6 +519,15 @@ fn nested(value: &Bound<'_, PyAny>, depth: usize) -> PyResult<Value> {
     if let Ok(s) = value.extract::<String>() {
         return Ok(Value::Str(s));
     }
+    // `bytes` and nothing else that holds octets. A `bytearray` is
+    // mutable and a `memoryview` is a window onto something that may be,
+    // and a parameter is read after this call returns, so taking either
+    // would be taking a promise the caller can break. It is the same
+    // type the loader takes for a byte string column, which is the point
+    // of picking one.
+    if let Ok(b) = value.cast::<PyBytes>() {
+        return Ok(Value::Bytes(b.as_bytes().to_vec()));
+    }
     if let Ok(n) = value.extract::<i64>() {
         return Ok(Value::Int(n));
     }
@@ -634,6 +652,6 @@ fn refused(value: &Bound<'_, PyAny>) -> PyErr {
         .and_then(|name| name.extract::<String>())
         .unwrap_or_else(|_| "that".to_string());
     pyo3::exceptions::PyTypeError::new_err(format!(
-        "a parameter cannot be a {name}: zu holds nulls, booleans, integers, floats, strings, lists, records, dates, times, datetimes and durations"
+        "a parameter cannot be a {name}: zu holds nulls, booleans, integers, floats, strings, byte strings, lists, records, dates, times, datetimes and durations"
     ))
 }
