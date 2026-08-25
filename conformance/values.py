@@ -35,6 +35,7 @@ integer either way.
 from __future__ import annotations
 
 import datetime
+import decimal
 import math
 from dataclasses import dataclass
 
@@ -660,6 +661,13 @@ def same(want: object, got: object) -> bool:
         if math.isnan(want) and math.isnan(got):
             return True
         return math.copysign(1.0, want) == math.copysign(1.0, got) and want == got
+    # Two decimals of one number at two scales are equal to Python and
+    # print differently, and what a case asserts is what a reader would
+    # see, so the scale is compared as well. It has no case to read yet,
+    # since DECIMAL is a reserved name, and the rule is written where the
+    # reference writes it rather than left for the first one to discover.
+    if isinstance(want, decimal.Decimal) and isinstance(got, decimal.Decimal):
+        return want.as_tuple().exponent == got.as_tuple().exponent and want == got
     if isinstance(want, list) and isinstance(got, list):
         return len(want) == len(got) and all(same(a, b) for a, b in zip(want, got, strict=True))
     if isinstance(want, Walk) and isinstance(got, Walk):
@@ -681,6 +689,15 @@ def show(value: object) -> str:
         return f'INT64 "{value}"'
     if isinstance(value, float):
         return f'FLOAT64 "{_show_float(value)}"'
+    # A decimal is a value a statement can hand back today even though
+    # DECIMAL is still a reserved name a case may not write, since CAST
+    # reaches one and no case declares one. That makes this the got side
+    # of a report and never the want side, and a report that could not
+    # print what it got would be the least useful moment to find out.
+    # Formatted rather than str()'d because Python prints some decimals
+    # with an exponent and the reference runner never does.
+    if isinstance(value, decimal.Decimal):
+        return f'DECIMAL "{format(value, "f")}"'
     if isinstance(value, str):
         return f"STRING {quote(value)}"
     # Upper case because ISO writes the literal that way, and a report

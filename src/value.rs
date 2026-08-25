@@ -10,8 +10,9 @@
 use std::collections::HashMap;
 
 use pyo3::prelude::*;
+use pyo3::sync::PyOnceLock;
 use pyo3::types::{
-    PyBool, PyBytes, PyDate, PyDateTime, PyDelta, PyDict, PyList, PyTime, PyTuple, PyTzInfo,
+    PyBool, PyBytes, PyDate, PyDateTime, PyDelta, PyDict, PyList, PyTime, PyTuple, PyType, PyTzInfo,
 };
 use zu_common::temporal::{NANOS_PER_DAY, NANOS_PER_MINUTE, civil_from_days, days_from_civil};
 use zu_common::{DurationKind, Temporal};
@@ -306,6 +307,26 @@ impl Duration {
     }
 }
 
+/// `decimal.Decimal`, imported once and kept.
+///
+/// The type object rather than the module, since both directions want
+/// it: one to build a decimal and one to recognise a parameter that is
+/// already one. `decimal` is in the standard library and importing it
+/// costs a few hundred microseconds the first time, which is a price
+/// worth paying once and not once a cell.
+static DECIMAL: PyOnceLock<Py<PyType>> = PyOnceLock::new();
+
+fn decimal_type(py: Python<'_>) -> PyResult<&Bound<'_, PyType>> {
+    DECIMAL
+        .get_or_try_init(py, || {
+            Ok(PyModule::import(py, "decimal")?
+                .getattr("Decimal")?
+                .downcast_into::<PyType>()?
+                .unbind())
+        })
+        .map(|ty| ty.bind(py))
+}
+
 /// One engine value as the Python object it is.
 pub fn to_py<'py>(py: Python<'py>, value: &Value, names: &Names) -> PyResult<Bound<'py, PyAny>> {
     Ok(match value {
@@ -321,6 +342,19 @@ pub fn to_py<'py>(py: Python<'py>, value: &Value, names: &Names) -> PyResult<Bou
         // same one the loader takes for a byte string column, so a
         // round trip through any of the three is one type.
         Value::Bytes(b) => PyBytes::new(py, b).into_any(),
+        // `decimal.Decimal` and not `float`. The engine holds this
+        // exactly because a tenth is not a binary fraction, and handing
+        // it over as a float would lose both the value and the number
+        // of places on the last step of the journey. The standard
+        // library already has the type, so a notebook that reads a
+        // money column gets something it can add up without importing
+        // anything.
+        //
+        // Built from the text rather than from the digits and the
+        // scale, because `Decimal("1.20")` is the one constructor that
+        // is exact for both: it keeps two places where a float would
+        // keep neither, and the spelling is the one the engine prints.
+        Value::Decimal(d) => decimal_type(py)?.call1((d.to_string(),))?,
         Value::Node { table, offset } => Node {
             table: names.node(*table),
             offset: *offset,
@@ -474,6 +508,44 @@ fn datetime_of<'py>(
     )
 }
 
+/// A `decimal.Decimal` as the engine's, exactly or not at all.
+///
+/// Read through `format(d, "f")` rather than `str(d)`, because Python
+/// prints some decimals with an exponent and `Decimal("1E+2")` is a
+/// hundred at no places rather than a one at two of them. The `f`
+/// format is always the digits written out, so the number of them after
+/// the point is the scale and there is nothing left to interpret.
+///
+/// Every refusal here is a value the engine has no decimal for, and
+/// each says which: a NaN or an infinity is not an exact number at all,
+/// thirty eight digits is the largest precision `DECIMAL(p, s)` takes
+/// and the largest an i128 holds, and a scale past that is a number
+/// whose point is further right than any column could declare. Failing
+/// at the call is the point: a parameter that arrived as a float would
+/// be a query comparing a price against something that is not it.
+fn decimal_from_py(value: &Bound<'_, PyAny>) -> PyResult<Value> {
+    let plain: String = value.call_method1("__format__", ("f",))?.extract()?;
+    let scale = match plain.split_once('.') {
+        Some((_, fraction)) => fraction.len(),
+        None => 0,
+    };
+    if scale > usize::from(zu_common::decimal::MAX_DIGITS) {
+        return Err(pyo3::exceptions::PyValueError::new_err(format!(
+            "the decimal {plain} has {scale} digits after the point, and a decimal here holds at \
+             most {}",
+            zu_common::decimal::MAX_DIGITS
+        )));
+    }
+    match zu_common::Decimal::parse(&plain, scale as u16) {
+        Some(d) => Ok(Value::Decimal(d)),
+        None => Err(pyo3::exceptions::PyValueError::new_err(format!(
+            "{plain} is not a decimal this engine holds: it takes an exact number of at most {} \
+             digits, so a NaN, an infinity and anything wider are all outside it",
+            zu_common::decimal::MAX_DIGITS
+        ))),
+    }
+}
+
 /// An offset in minutes as a `datetime.timezone`.
 fn zone_of(py: Python<'_>, offset: i16) -> PyResult<Bound<'_, PyTzInfo>> {
     PyTzInfo::fixed_offset(py, PyDelta::new(py, 0, i32::from(offset) * 60, 0, true)?)
@@ -527,6 +599,15 @@ fn nested(value: &Bound<'_, PyAny>, depth: usize) -> PyResult<Value> {
     // of picking one.
     if let Ok(b) = value.cast::<PyBytes>() {
         return Ok(Value::Bytes(b.as_bytes().to_vec()));
+    }
+    // Before the integer and the float arms, because a
+    // `decimal.Decimal` is neither and would go through `extract::<f64>`
+    // otherwise, which is the loss the caller picked the type to avoid.
+    // Read from `str(d)` for the reason it is built from a string: that
+    // is the spelling that carries both the digits and how many of them
+    // are after the point.
+    if value.is_instance(decimal_type(value.py())?.as_any())? {
+        return decimal_from_py(value);
     }
     if let Ok(n) = value.extract::<i64>() {
         return Ok(Value::Int(n));

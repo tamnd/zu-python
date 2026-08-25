@@ -42,6 +42,7 @@ from __future__ import annotations
 
 import contextlib
 import datetime
+import decimal
 import os
 import time
 from collections import deque
@@ -298,7 +299,11 @@ class _Type:
 
 STRING = _Type("STRING", (str,))
 BINARY = _Type("BINARY", (bytes, bytearray, memoryview))
-NUMBER = _Type("NUMBER", (int, float))
+# `decimal.Decimal` is in here because PEP 249 puts every numeric
+# column under NUMBER and a decimal is one. It is not in a set of its
+# own: a program asking whether a column holds a number should get yes
+# for a price, and the exact type is what the value already is.
+NUMBER = _Type("NUMBER", (int, float, decimal.Decimal))
 DATETIME = _Type("DATETIME", (datetime.date, datetime.time, datetime.datetime))
 #: The values that identify a row, which in a graph are the ones that
 #: carry a table and an offset in it.
