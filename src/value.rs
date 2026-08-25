@@ -321,7 +321,7 @@ fn decimal_type(py: Python<'_>) -> PyResult<&Bound<'_, PyType>> {
         .get_or_try_init(py, || {
             Ok(PyModule::import(py, "decimal")?
                 .getattr("Decimal")?
-                .downcast_into::<PyType>()?
+                .cast_into::<PyType>()?
                 .unbind())
         })
         .map(|ty| ty.bind(py))
