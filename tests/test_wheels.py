@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import wheel_tags
 
-VERSION = "0.0.1"
+VERSION = "0.0.2"
 
 
 def grid() -> list[str]:
@@ -200,11 +200,11 @@ def test_a_build_that_produced_two_wheels_is_caught() -> None:
     # of them is the one that gets uploaded.
     built = [
         f"zudb-{VERSION}-cp314-cp314t-manylinux_2_28_x86_64.whl",
-        "zudb-0.0.2-cp314-cp314t-manylinux_2_28_x86_64.whl",
+        "zudb-0.0.3-cp314-cp314t-manylinux_2_28_x86_64.whl",
     ]
     assert wheel_tags.check_one(built, "cp314-cp314t", "manylinux_2_28_x86_64") == [
-        "2 wheels out of one build: zudb-0.0.1-cp314-cp314t-manylinux_2_28_x86_64.whl, "
-        "zudb-0.0.2-cp314-cp314t-manylinux_2_28_x86_64.whl"
+        "2 wheels out of one build: zudb-0.0.2-cp314-cp314t-manylinux_2_28_x86_64.whl, "
+        "zudb-0.0.3-cp314-cp314t-manylinux_2_28_x86_64.whl"
     ]
 
 

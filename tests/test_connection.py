@@ -78,7 +78,7 @@ def test_repr_names_the_file_and_says_when_it_is_closed(tmp_path: Path) -> None:
 
 
 def test_the_engine_and_abi_versions_are_reported(empty: zudb.Connection) -> None:
-    assert zudb.__version__ == "0.0.1"
+    assert zudb.__version__ == "0.0.2"
     assert zudb.__abi_version__.count(".") == 1
 
 
