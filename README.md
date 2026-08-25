@@ -32,6 +32,7 @@ The interesting parts:
 - **Complete `.pyi` stubs inside the wheel**, checked against the runtime in CI, so mypy and pyright and your editor all work with no extra install.
 - **`import zudb` costs about 4 ms** on this machine and is gated at 50, and pandas, polars and pyarrow are imported when you ask for one and not before. Importing pandas costs 700 ms, which is most of why none of them is a dependency.
 - **Graph values are real classes.** `Node`, `Rel`, and `Path` have `.labels`, `.id`, `.properties`, and an HTML repr. Not dicts, because a dict cannot tell a property named `labels` apart from the label set.
+- **An exact decimal is a `decimal.Decimal`.** `CAST('1.20' AS DECIMAL(5, 2))` comes back with both places, and one goes in as a parameter the same way. Not a `float`, because a tenth is not a binary fraction and a price held as one is not the price.
 
 ## A database with no file
 

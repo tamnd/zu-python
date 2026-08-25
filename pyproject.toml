@@ -4,7 +4,7 @@ build-backend = "maturin"
 
 [project]
 name = "zudb"
-version = "0.0.1"
+version = "0.0.2"
 description = "zu: an embedded property-graph database, in your process"
 readme = "README.md"
 license = "Apache-2.0"

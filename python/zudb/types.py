@@ -10,6 +10,7 @@ and the interpreter does not is a name that fails at the first
 from __future__ import annotations
 
 import datetime
+import decimal
 from typing import TypeAlias
 
 from ._zudb import Duration, Node, Path, Rel
@@ -22,12 +23,15 @@ __all__ = ["Value"]
 #: duration and hands one back, since a ``timedelta`` cannot hold every
 #: duration zu can. ``bytes`` and not ``bytearray``, because a parameter
 #: is read after the call that takes it returns and a mutable buffer is a
-#: promise the caller can break.
+#: promise the caller can break. A ``decimal.Decimal`` goes both ways
+#: and is the one exact number here: a price read into a ``float`` would
+#: not be the price, which is why the engine has a type for it at all.
 Value: TypeAlias = (
     None
     | bool
     | int
     | float
+    | decimal.Decimal
     | str
     | bytes
     | datetime.date
