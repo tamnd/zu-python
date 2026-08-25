@@ -444,11 +444,18 @@ async def test_the_loop_runs_while_a_stream_waits_for_a_batch(tmp_path: Path) ->
     conn = await crowded(tmp_path / "free.zu1", LONG)
     ticks = 0
 
+    # Yielding with no delay rather than with a small one, so that a
+    # tick is one turn of the loop and not one turn of the system
+    # clock. Asking for a millisecond gets a millisecond on Linux and
+    # macOS and about fifteen on Windows, which is what that platform's
+    # timer can resolve, and fifty milliseconds of waiting below then
+    # buys three ticks instead of fifty. This read 9 against a gate of
+    # 10 there and it was the clock it was measuring, not the loop.
     async def tick() -> None:
         nonlocal ticks
         while True:
             ticks += 1
-            await asyncio.sleep(0.001)
+            await asyncio.sleep(0)
 
     async with conn:
         counting = asyncio.create_task(tick())
@@ -457,6 +464,10 @@ async def test_the_loop_runs_while_a_stream_waits_for_a_batch(tmp_path: Path) ->
             await asyncio.sleep(0.05)
         counting.cancel()
 
+    # A loop held for the length of a batch would leave this task the
+    # gaps between batches, which is a handful of turns. A free one
+    # gives it thousands, so the gate is nowhere near either answer and
+    # does not care how fast the machine is.
     assert ticks > 10
 
 
