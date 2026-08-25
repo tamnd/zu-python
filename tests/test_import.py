@@ -27,13 +27,21 @@ BUDGET = 50.0
 
 #: Milliseconds for the Python around the extension, which is where
 #: growth would come from. The extension is the engine and is what it
-#: is; the package is a dozen names, `datetime`, `typing`, and the union
-#: that describes a value, and it costs about three milliseconds here,
-#: most of it `typing`. A ceiling rather than a target: what it is meant
-#: to catch is a module imported at package scope by somebody who did
-#: not need it there, since each one of those costs milliseconds and
-#: none of them costs enough to notice on its own.
-OURS = 20.0
+#: is; the package is a dozen names, `datetime`, `decimal`, `typing`,
+#: and the union that describes a value, and it costs about seven
+#: milliseconds here, most of it `typing` and `decimal`. A ceiling
+#: rather than a target: what it is meant to catch is a module imported
+#: at package scope by somebody who did not need it there, since each
+#: one of those costs milliseconds and none of them costs enough to
+#: notice on its own.
+#:
+#: `decimal` is the one that was needed. An exact decimal is a value
+#: this engine holds and hands back, so `Value` has to name the class,
+#: and naming a class means importing the module it is in. It is the
+#: most expensive import in the package, around four milliseconds, and
+#: the ceiling moved by five when it arrived rather than the union
+#: quietly becoming a string that no `get_type_hints` can resolve.
+OURS = 25.0
 
 #: Runs, because a machine that measures itself is a busy machine. The
 #: fastest says what the import costs and the middle one says the
