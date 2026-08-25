@@ -425,25 +425,55 @@ def test_python_keeps_running_while_a_flush_does(graph: zudb.Connection) -> None
     assert ticks > 1000, f"the main thread only got {ticks} turns"
 
 
-#: Rows for the comparison against `INSERT`, and few enough that the
-#: `INSERT` half finishes in a few seconds. It is the slow half by three
-#: orders of magnitude, and it gets slower as the table grows, because
-#: every row of it is a commit and a fold.
-COMPARED = 200
+#: What the `INSERT` half of the comparison is allowed to spend, and
+#: the row count is worked out from it rather than written down. A fixed
+#: row count cannot serve both kinds of machine this runs on, because
+#: what an `INSERT` costs is what a commit costs and that is a property
+#: of the disk and not of the engine. Measured per row: 24 ms on a
+#: server with a real disk under contention, 80 us on a hosted CI runner
+#: where a commit is not reaching a platter at all. Three hundred times
+#: apart, from the same engine. Two hundred rows is four seconds on the
+#: first and sixteen milliseconds on the second.
+BUDGET = 1.5
+
+#: How many `INSERT`s are timed to learn what one costs here. Enough to
+#: average over, few enough to be quick on the slow machine, where this
+#: alone is a second.
+CALIBRATE = 40
+
+#: The row count never goes outside this, whatever the calibration says.
+#: The floor is where the appender has enough rows to have amortised the
+#: one commit it does. The ceiling is memory and patience.
+FEWEST = 200
+MOST = 40_000
+
+
+def _rows(count: int) -> list[tuple[int, str]]:
+    return [(uid, f"p{uid}") for uid in range(1, count)]
+
+
+def _time_inserting(conn: zudb.Connection, rows: list[tuple[int, str]]) -> float:
+    started = time.perf_counter()
+    for uid, name in rows:
+        conn.execute("INSERT (p:person {uid: $u, name: $n})", {"u": uid, "n": name})
+    return time.perf_counter() - started
 
 
 @pytest.mark.timing
 def test_appending_beats_inserting_by_the_margin_that_makes_it_worth_having(
     tmp_path: Path,
 ) -> None:
-    rows = [(uid, f"p{uid}") for uid in range(1, COMPARED)]
+    # What one INSERT costs here, asked rather than assumed.
+    with zudb.connect(tmp_path / "calibration.zu1") as conn:
+        conn.execute("INSERT (p:person {uid: 0, name: 'seed'})")
+        each = _time_inserting(conn, _rows(CALIBRATE)) / (CALIBRATE - 1)
+
+    compared = min(MOST, max(FEWEST, int(BUDGET / each)))
+    rows = _rows(compared)
 
     with zudb.connect(tmp_path / "inserted.zu1") as conn:
         conn.execute("INSERT (p:person {uid: 0, name: 'seed'})")
-        started = time.perf_counter()
-        for uid, name in rows:
-            conn.execute("INSERT (p:person {uid: $u, name: $n})", {"u": uid, "n": name})
-        inserting = time.perf_counter() - started
+        inserting = _time_inserting(conn, rows)
 
     with zudb.connect(tmp_path / "appended.zu1") as conn:
         conn.execute("INSERT (p:person {uid: 0, name: 'seed'})")
@@ -451,15 +481,24 @@ def test_appending_beats_inserting_by_the_margin_that_makes_it_worth_having(
         with conn.appender("person") as app:
             app.append_rows(rows)
         appending = time.perf_counter() - started
-        assert conn.execute("MATCH (p:person) RETURN count(p) AS n").fetchone() == (COMPARED,)
+        assert conn.execute("MATCH (p:person) RETURN count(p) AS n").fetchone() == (compared,)
 
-    # Measured at about 150 times on this machine at this row count and
-    # rising with it, since one commit is one commit however many rows
-    # it carries. It is 18 on a shared CI runner, where a commit costs
-    # 25 ms of somebody else's disk and the appender's single one is
-    # most of what it spends, so the gate is 5: the number that says the
-    # appender is still batching rather than the number either machine
-    # hits.
+    # The appender does one commit however many rows it carries, so its
+    # cost is nearly all fixed and the ratio grows with the row count.
+    # That is the property being tested and it is why the row count is
+    # chosen instead of fixed: at two hundred rows on a machine where a
+    # commit is free, the appender is measured almost entirely on what
+    # it costs to start, the ratio sits around three, and it passes or
+    # fails on which way the runner was leaning that morning. It did
+    # both. Spending the same wall clock on the INSERT side everywhere
+    # puts enough rows on the appender for the answer to be about the
+    # engine.
+    #
+    # Measured at 44 with 200 rows, 81 with 1000 and 659 with 5000 on a
+    # server with a real disk. The gate is 5 because it is the number
+    # that says the appender is still batching, not the number any
+    # machine hits.
     assert inserting > 5 * appending, (
-        f"{COMPARED} rows: {inserting * 1000:.0f} ms inserted, {appending * 1000:.0f} ms appended"
+        f"{compared} rows at {each * 1e6:.0f} us an INSERT: "
+        f"{inserting * 1000:.0f} ms inserted, {appending * 1000:.0f} ms appended"
     )
