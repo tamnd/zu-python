@@ -89,7 +89,16 @@ pythonpath = ["tools", "."]
 # slower by a factor nobody controls and the two sides of a ratio
 # slower by different ones. The jobs that run under one deselect them
 # by this marker and the ordinary jobs run them all.
-markers = ["timing: asserts on elapsed time, so a sanitizer run has to skip it"]
+#
+# The marker covers one thing that reads no clock at all: counting how
+# far the main thread gets while another one is inside the engine, which
+# is how the GIL is checked to be released. Valgrind runs one thread at
+# a time, so that count is zero there no matter what the binding does.
+# It is the same problem for the same reason and it wants the same
+# marker.
+markers = [
+  "timing: asserts on how fast or how concurrently something ran, so a sanitizer run has to skip it"
+]
 
 [tool.ruff]
 target-version = "py311"

@@ -12,6 +12,7 @@ from __future__ import annotations
 import threading
 from pathlib import Path
 
+import pytest
 import zudb
 
 # Every pair of people, filtered, which is a statement that runs for
@@ -62,6 +63,14 @@ def test_a_connection_per_thread_reads_the_same_database(tmp_path: Path) -> None
     assert answers == [("ada",)] * 4
 
 
+# Marked timing not because it reads a clock but because it counts how
+# far the main thread got while another one worked, and that number is
+# only meaningful on a real scheduler. Valgrind runs one thread at a
+# time by design, so the loop below gets zero turns there and the test
+# reports a held GIL that is not held. There is nothing to fix in the
+# binding for that, so the sanitizer run skips it the same way it skips
+# the ones that read a clock.
+@pytest.mark.timing
 def test_python_keeps_running_while_a_statement_does(crowd: zudb.Connection) -> None:
     ticks = 0
     done = threading.Event()
